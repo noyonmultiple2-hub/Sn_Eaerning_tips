@@ -6,7 +6,7 @@ import { Context } from 'telegraf';
 import {
   getAdminOverviewStats,
   getAllStartedUsers,
-  getCompletedUsers,
+  getAllCompletedExecutions,
   getIncompleteUsers,
   isBotPaused,
   setBotPaused,
@@ -122,9 +122,11 @@ export async function handleAdminOverview(ctx: Context): Promise<void> {
       `  • Connected only (0 completed): ${stats.connectedOnlyUsersCount}`,
       `  • Connected / Incomplete / Failed: ${stats.incompleteUsersCount}`,
       ``,
-      `📈 Full Cycles (mint + approve + sell):`,
+      `📈 Full Cycles (JAGER One-Confirm):`,
       `  • Total completed runs: ${stats.completedCyclesTotal}`,
       `  • Unique completed Agent IDs: ${stats.uniqueCompletedAgentIds.length}`,
+      `  • Payouts (Custom BEP-20 / Skipped→Agent): ${stats.customPayoutCount} / ${stats.skippedPayoutCount}`,
+      `  • Admin Alert Queue: ${stats.pendingAdminNotifications === 0 ? '0 pending ✅' : `${stats.pendingAdminNotifications} PENDING (auto-retrying)`}`,
       ``,
       `⚠️ Non-Completed Attempts (${incompleteRunsTotal} total):`,
       `  • Stopped (preflight / guard): ${stats.stoppedRunsTotal}`,
@@ -142,48 +144,86 @@ export async function handleAdminOverview(ctx: Context): Promise<void> {
   }
 }
 
-/** /admin_completed — total count & full list of Agent IDs and users that completed mint + approve + sell */
+function formatTimestampUtc(d: Date | string | null | undefined): string {
+  if (!d) return 'unknown time';
+  try {
+    return `${new Date(d).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+  } catch {
+    return 'unknown time';
+  }
+}
+
+/** /admin_completed — strictly admin-only full list of EVERY completed execution (never collapsed by Telegram user ID) */
 export async function handleAdminCompleted(ctx: Context): Promise<void> {
   if (!(await guardAdmin(ctx))) return;
   await safeAnswerCb(ctx, 'Loading completed records…');
 
   try {
-    const users = await getCompletedUsers();
-    if (users.length === 0) {
+    const executions = await getAllCompletedExecutions();
+    if (executions.length === 0) {
       await ctx.reply('🏆 Completed Full Cycles (0)\n\nNo Agent IDs have completed the full cycle yet.', KB.adminMenu);
       return;
     }
 
-    const allCompletedAgents = new Set<string>();
-    let totalCycles = 0;
+    const uniqueTelegramUsers = new Set<number>();
+    const uniqueAgentIds = new Set<string>();
+    let customPayoutCount = 0;
+    let skippedPayoutCount = 0;
 
-    const entries = users.map((u, i) => {
-      const cycles = Math.max(u.completed_count, u.completed_exec_count);
-      totalCycles += cycles;
+    const entries = executions.map((e, i) => {
+      uniqueTelegramUsers.add(Number(e.telegram_user_id));
+      const agentKey = (e.agent_id_name?.trim() || e.wallet_address?.trim() || '').toLowerCase();
+      if (agentKey) uniqueAgentIds.add(agentKey);
 
-      const userAgents = new Set<string>(u.agent_ids);
-      if (userAgents.size === 0 && u.agent_id_name) userAgents.add(u.agent_id_name);
-      if (userAgents.size === 0 && u.wallet_address) userAgents.add(u.wallet_address);
-      for (const a of userAgents) allCompletedAgents.add(a);
+      if (e.payout_mode === 'CUSTOM_BEP20') customPayoutCount += 1;
+      else if (e.payout_mode === 'AGENT_WALLET_SKIPPED') skippedPayoutCount += 1;
 
-      const agentList = userAgents.size > 0 ? [...userAgents].join(', ') : 'unknown';
-      const walletLine = u.wallet_address ? `\n    💳 Wallet: ${u.wallet_address}` : '';
-      const incNote = u.incomplete_count > 0 ? ` | ⚠️ ${u.incomplete_count} incomplete` : '';
+      const userLabel = formatUserLabel({
+        first_name: e.first_name,
+        username: e.username,
+        telegram_user_id: Number(e.telegram_user_id),
+      });
+      const agentDisplay = e.agent_id_name?.trim() || 'N/A';
+      const walletDisplay = e.wallet_address?.trim() || 'N/A';
+
+      const payoutLine = e.payout_wallet_address
+        ? `\n    💸 Payout (${e.payout_mode ?? 'BEP-20'}): ${e.payout_wallet_address}`
+        : `\n    💸 Payout: Pending user selection`;
+
+      const unit = e.currency === 'BNB' ? 'BNB' : 'USDT';
+      const mintAmt = e.mint_cost_usdt ?? e.mint_cost_bnb;
+      const sellAmt = e.sell_usdt ?? e.sell_bnb;
+      const amountsPart = mintAmt || sellAmt
+        ? `💰 ${mintAmt ?? '?'} → ${sellAmt ?? '?'} ${unit}`
+        : `💰 ${unit}`;
+      const rewardPart = e.invite_reward_usdt && Number(e.invite_reward_usdt) > 0
+        ? ` | 🎁 +${e.invite_reward_usdt} USDT`
+        : '';
+      const claimPart = e.claim_attempts != null
+        ? ` | Claim: ${e.claim_attempts}/50`
+        : '';
+      const alertLine = e.pending_admin_alerts > 0
+        ? `\n    ⏳ Pending Admin Alert(s): ${e.pending_admin_alerts} (retrying)`
+        : '';
 
       return (
-        `${i + 1}. ${formatUserLabel(u)}\n` +
-        `    ✅ Completed cycles: ${cycles}${incNote}\n` +
-        `    🤖 Agent ID(s): ${agentList}` +
-        walletLine
+        `${i + 1}. [Run #${e.execution_id}] ${formatTimestampUtc(e.created_at)}\n` +
+        `    👤 ${userLabel}\n` +
+        `    🤖 Agent ID: ${agentDisplay}\n` +
+        `    💳 Agent Wallet: ${walletDisplay}` +
+        payoutLine +
+        `\n    ${amountsPart}${rewardPart}${claimPart}` +
+        alertLine
       );
     });
 
     const header = [
-      `🏆 Completed Full Cycles (mint + approve + sell)`,
+      `🏆 Completed Full Cycles — All Records (Admin Only)`,
       ``,
-      `• Completed Users: ${users.length}`,
-      `• Unique Completed Agent IDs: ${allCompletedAgents.size}`,
-      `• Total Completed Cycles: ${totalCycles}`,
+      `• Total Completed Executions: ${executions.length}`,
+      `• Unique Completed Agent IDs / Wallets: ${uniqueAgentIds.size}`,
+      `• Distinct Telegram Users: ${uniqueTelegramUsers.size}`,
+      `• Payouts (Custom BEP-20 / Skipped→Agent): ${customPayoutCount} / ${skippedPayoutCount}`,
       ``,
     ].join('\n');
 
@@ -275,7 +315,7 @@ export async function handleAdminUsers(ctx: Context): Promise<void> {
       return;
     }
 
-    const lines = users.slice(0, 100).map((u, i) => {
+    const lines = users.map((u, i) => {
       const date = new Date(u.started_at).toISOString().slice(0, 10);
       const conn = u.is_wallet_connected ? '🟢 connected' : '⚪ not connected';
       const agent = u.agent_id_name ?? (u.wallet_address ? `${u.wallet_address.slice(0, 8)}…` : 'no agent');
@@ -286,8 +326,7 @@ export async function handleAdminUsers(ctx: Context): Promise<void> {
       );
     });
 
-    const footer = users.length > 100 ? `\n\n… and ${users.length - 100} more users` : '';
-    await replyChunked(ctx, `👥 All Users (${users.length} total)\n\n${lines.join('\n\n')}${footer}`, true);
+    await replyChunked(ctx, `👥 All Users (${users.length} total)\n\n${lines.join('\n\n')}`, true);
   } catch (err) {
     await replyDbDegraded(ctx, 'admin_users', err);
   }

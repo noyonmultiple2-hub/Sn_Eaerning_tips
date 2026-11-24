@@ -51,6 +51,17 @@ export const KB = {
     [Markup.button.callback('❌ Cancel', 'cancel')],
   ]),
 
+  /** Shown on the single combined JAGER full-cycle preview (ONE confirmation) */
+  confirmCycle: Markup.inlineKeyboard([
+    [Markup.button.callback('✅ Confirm & Execute Full Cycle', 'confirm_execute_cycle')],
+    [Markup.button.callback('❌ Cancel', 'cancel_preview')],
+  ]),
+
+  /** Shown after cycle completes while awaiting user's BEP-20 payout wallet or Skip */
+  payoutWalletPrompt: Markup.inlineKeyboard([
+    [Markup.button.callback('⏭️ স্কিপ (এজেন্ট ওয়ালেটে পেমেন্ট)', 'skip_payout_wallet')],
+  ]),
+
   /** Shown when execution is running (single cancel button) */
   cancelOnly: Markup.inlineKeyboard([
     [Markup.button.callback('❌ Cancel Job', 'cancel')],
@@ -58,6 +69,7 @@ export const KB = {
 
   /** Shown after completion / error */
   postExecution: Markup.inlineKeyboard([
+    [Markup.button.callback('🔄 Connect New Wallet (Next .ai ID)', 'switch_wallet')],
     [Markup.button.callback('🚀 Complete All Process', 'complete_process')],
     [Markup.button.callback('📊 My Status & Jobs', 'my_jobs')],
     [Markup.button.callback('❌ Cancel', 'cancel')],

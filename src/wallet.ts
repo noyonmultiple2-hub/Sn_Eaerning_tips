@@ -86,6 +86,15 @@ const sessions = new Map<number, WalletSession>();
 // Per-user execution mutex — prevents concurrent contract-calls on one session.
 const execLocks = new Map<number, Promise<void>>();
 
+// Per-user pairing generation counter — invalidates stale background verifyAndBindSession calls
+// if the user restarts /connect or clicks Cancel before pairing completes.
+const pairingNonces = new Map<number, number>();
+function bumpPairingNonce(userId: number): number {
+  const next = (pairingNonces.get(userId) ?? 0) + 1;
+  pairingNonces.set(userId, next);
+  return next;
+}
+
 // ─── Core baw CLI helper ─────────────────────────────────────────────────────
 
 /**
@@ -144,7 +153,8 @@ export async function callBaw(
       if (code !== 0) {
         // Surface the most useful part of the error
         const detail = stderr.trim() || stdout.trim();
-        const isExpired = /SESSION_EXPIRED|UNCONNECTED|not.*logged|unauthorized/i.test(detail);
+        const isExpired =
+          /SESSION_EXPIRED|UNCONNECTED|TOKEN_EXPIRED|LOGIN_EXPIRED|INVALID_SESSION|not.*logged|not.*signed.?in|please sign in|unauthorized/i.test(detail);
         const err = new Error(
           isExpired
             ? 'SESSION_EXPIRED: Binance Wallet session has expired. Please reconnect.'
@@ -153,10 +163,20 @@ export async function callBaw(
         (err as Error & { isSessionExpired?: boolean }).isSessionExpired = isExpired;
         return reject(err);
       }
+      const trimmed = stdout.trim();
       try {
-        resolve(JSON.parse(stdout.trim()));
+        resolve(JSON.parse(trimmed));
       } catch {
-        reject(new Error(`baw non-JSON output: ${stdout.slice(0, 200)}`));
+        // Fallback if CLI emitted a non-JSON banner/warning line before the JSON payload
+        const jsonStart = trimmed.indexOf('{');
+        const jsonEnd   = trimmed.lastIndexOf('}');
+        if (jsonStart >= 0 && jsonEnd > jsonStart) {
+          try {
+            resolve(JSON.parse(trimmed.slice(jsonStart, jsonEnd + 1)));
+            return;
+          } catch { /* fall through */ }
+        }
+        reject(new Error(`baw non-JSON output: ${trimmed.slice(0, 200)}`));
       }
     });
   });
@@ -296,28 +316,38 @@ async function refreshSessionFromBaw(userId: number): Promise<WalletSession | nu
   }
 }
 
-/** Background verify — calls onConnected / onFailed when done. */
+/** Background verify — calls onConnected / onFailed when done (ignores stale/cancelled attempts). */
 export function verifyAndBindSession(
   userId: number,
   qrCodeId: string,
   onConnected: (s: WalletSession) => void,
   onFailed: (reason: string) => void,
 ): void {
+  const myNonce = bumpPairingNonce(userId);
   // Fire-and-forget; caller does NOT await.
   (async () => {
     try {
-      logger.info({ userId, qrCodeId }, 'baw auth verify: waiting for user approval');
+      logger.info({ userId, qrCodeId, pairingNonce: myNonce }, 'baw auth verify: waiting for user approval');
       await callBaw(['auth', 'verify', '--qrCodeId', qrCodeId], userId, 310_000);
 
+      if (pairingNonces.get(userId) !== myNonce) {
+        logger.info({ userId, qrCodeId, pairingNonce: myNonce }, 'Ignoring stale baw auth verify completion (superseded/cancelled)');
+        return;
+      }
+
       const session = await refreshSessionFromBaw(userId);
+      if (pairingNonces.get(userId) !== myNonce) return;
+
       if (!session?.walletAddress) {
         onFailed('Connected but could not read wallet address. Try /connect again.');
         return;
       }
 
       await markSessionConnected(userId, session.walletAddress, session.agentIdName ?? '');
+      if (pairingNonces.get(userId) !== myNonce) return;
       onConnected(session);
     } catch (err) {
+      if (pairingNonces.get(userId) !== myNonce) return;
       const msg = (err as Error).message ?? '';
       onFailed(
         msg.includes('expired') || msg.includes('QR_CODE_EXPIRED')
@@ -372,7 +402,7 @@ export async function syncAgentId(userId: number, agentIdName: string): Promise<
   const clean = agentIdName.trim();
   if (!clean) return;
   const existing = sessions.get(userId);
-  if (existing && !existing.agentIdName) {
+  if (existing) {
     existing.agentIdName = clean;
   }
   try {
@@ -392,6 +422,7 @@ export function getSession(userId: number): WalletSession | undefined {
 }
 
 export async function clearSession(userId: number): Promise<void> {
+  bumpPairingNonce(userId);
   sessions.delete(userId);
   try { await callBaw(['auth', 'signout'], userId, 10_000); } catch { /* ok */ }
 }
@@ -414,16 +445,26 @@ export async function isSessionConnectedDb(
     );
     if (!rows.length || !rows[0].is_wallet_connected) {
       const mem = sessions.get(userId);
-      return mem?.walletAddress
-        ? { connected: true, address: mem.walletAddress, dbAgentId: rows[0]?.agent_id_name ?? undefined }
-        : { connected: false };
+      if (!mem?.walletAddress) return { connected: false };
+      const sameWalletAsDb =
+        rows[0]?.wallet_address != null &&
+        rows[0].wallet_address.toLowerCase() === mem.walletAddress.toLowerCase();
+      return {
+        connected: true,
+        address: mem.walletAddress,
+        dbAgentId: sameWalletAsDb ? (rows[0]?.agent_id_name ?? undefined) : undefined,
+      };
     }
     // Restore from baw if memory is cold
     if (!sessions.get(userId)?.walletAddress) {
       const refreshed = await refreshSessionFromBaw(userId);
       if (refreshed?.walletAddress) {
-        // Keep DB wallet_address / agent_id_name synchronized
-        await markSessionConnected(userId, refreshed.walletAddress, refreshed.agentIdName ?? rows[0].agent_id_name ?? '');
+        // NEVER carry over a previous wallet's agent_id_name if the user switched wallets
+        const sameWalletAsDb =
+          rows[0].wallet_address != null &&
+          rows[0].wallet_address.toLowerCase() === refreshed.walletAddress.toLowerCase();
+        const safeAgentId = refreshed.agentIdName ?? (sameWalletAsDb ? (rows[0].agent_id_name ?? '') : '');
+        await markSessionConnected(userId, refreshed.walletAddress, safeAgentId);
       } else if (rows[0].wallet_address) {
         sessions.set(userId, {
           qrCodeId: '',
@@ -434,10 +475,15 @@ export async function isSessionConnectedDb(
         });
       }
     }
+    const activeAddress = sessions.get(userId)?.walletAddress ?? rows[0].wallet_address ?? undefined;
+    const sameWalletAsDb =
+      activeAddress != null &&
+      rows[0].wallet_address != null &&
+      rows[0].wallet_address.toLowerCase() === activeAddress.toLowerCase();
     return {
       connected: true,
-      address: sessions.get(userId)?.walletAddress ?? rows[0].wallet_address ?? undefined,
-      dbAgentId: rows[0].agent_id_name ?? undefined,
+      address: activeAddress,
+      dbAgentId: sameWalletAsDb ? (rows[0].agent_id_name ?? undefined) : undefined,
     };
   } catch (dbErr) {
     logger.error({ dbErr, userId }, 'isSessionConnectedDb failed — falling back to in-memory session');
@@ -607,10 +653,10 @@ export interface ContractCallResult {
 }
 
 const BAW_MIN_GAS_LIMIT  = 21_000;
-const BAW_SAFE_MAX_GAS   = 5_000_000; // safe ceiling well inside baw's 15,000,000 max
-const PRIMARY_GAS_BUFFER = 1.4;       // 40% buffer over live RPC estimateGas
-const RETRY_GAS_BUFFER   = 1.75;      // 75% buffer over live RPC estimateGas if 351805 recurs
-const RETRY_BUMP_FACTOR  = 1.45;      // minimum bump factor over primary appliedGasLimit on retry
+const BAW_SAFE_MAX_GAS   = 2_500_000; // safe LOW/MEDIUM ceiling well inside baw's 15,000,000 max
+const PRIMARY_GAS_BUFFER = 1.25;      // 25% LOW/MEDIUM buffer over live RPC estimateGas
+const RETRY_GAS_BUFFER   = 1.5;       // 50% buffer over live RPC estimateGas if 351805 recurs
+const RETRY_BUMP_FACTOR  = 1.3;       // conservative bump factor over primary appliedGasLimit on retry
 
 function clampGasLimit(gas: number): number {
   return Math.min(BAW_SAFE_MAX_GAS, Math.max(BAW_MIN_GAS_LIMIT, Math.ceil(gas)));
@@ -690,7 +736,8 @@ export async function executeContractCall(opts: {
   const prev = execLocks.get(userId) ?? Promise.resolve();
   let releaseLock!: () => void;
   const thisLock = new Promise<void>(r => { releaseLock = r; });
-  execLocks.set(userId, prev.then(() => thisLock));
+  const chainedLock = prev.then(() => thisLock);
+  execLocks.set(userId, chainedLock);
 
   try {
     await prev; // wait for any previous call to finish
@@ -814,6 +861,12 @@ export async function executeContractCall(opts: {
 
     // txHash may be at root or inside .data / .result (Binance API envelope)
     const execPayload = unwrap(execRaw);
+    if (String(execPayload.status ?? '').toUpperCase() === 'PENDING_CONFIRMATION') {
+      throw new Error(
+        `Developer Mode confirmation required in Binance App for [${step}] (status=PENDING_CONFIRMATION). ` +
+        `Ensure Developer Mode is enabled and within cap.`,
+      );
+    }
     const txHash = String(execPayload.txHash ?? execPayload.transactionHash ?? execPayload.tx_hash ?? '');
     if (!txHash || !/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
       throw new Error(`baw contract-call execute returned invalid txHash: ${JSON.stringify(execRaw).slice(0, 200)}`);
@@ -823,6 +876,9 @@ export async function executeContractCall(opts: {
     return { txHash, requestId, appliedGasLimit };
   } finally {
     releaseLock();
+    if (execLocks.get(userId) === chainedLock) {
+      execLocks.delete(userId);
+    }
   }
 }
 

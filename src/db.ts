@@ -112,18 +112,27 @@ export async function initDb(): Promise<void> {
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS executions (
-        id               BIGSERIAL PRIMARY KEY,
-        telegram_user_id BIGINT NOT NULL REFERENCES users(telegram_user_id) ON DELETE CASCADE,
-        wallet_address   TEXT,
-        agent_id_name    TEXT,
-        status           TEXT NOT NULL,
-        mint_cost_bnb    NUMERIC,
-        tokens_received  NUMERIC,
-        sell_bnb         NUMERIC,
-        pnl_or_fee       NUMERIC,
-        tx_hashes        JSONB,
-        summary          TEXT,
-        created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+        id                 BIGSERIAL PRIMARY KEY,
+        telegram_user_id   BIGINT NOT NULL REFERENCES users(telegram_user_id) ON DELETE CASCADE,
+        wallet_address     TEXT,
+        agent_id_name      TEXT,
+        mint_contract      TEXT,
+        status             TEXT NOT NULL,
+        currency           TEXT NOT NULL DEFAULT 'USDT',
+        mint_cost_bnb      NUMERIC,
+        mint_cost_usdt     NUMERIC,
+        tokens_received    NUMERIC,
+        sell_bnb           NUMERIC,
+        sell_usdt          NUMERIC,
+        pnl_or_fee         NUMERIC,
+        pnl_or_fee_usdt    NUMERIC,
+        invite_reward_usdt    NUMERIC,
+        claim_attempts        INT,
+        payout_wallet_address TEXT,
+        payout_mode           TEXT,
+        tx_hashes             JSONB,
+        summary               TEXT,
+        created_at            TIMESTAMPTZ NOT NULL DEFAULT now()
       );
     `);
 
@@ -133,6 +142,36 @@ export async function initDb(): Promise<void> {
     await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS wallet_address TEXT`);
     await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS agent_id_name TEXT`);
     await client.query(`ALTER TABLE executions ADD COLUMN IF NOT EXISTS wallet_address TEXT`);
+    await client.query(`ALTER TABLE executions ADD COLUMN IF NOT EXISTS mint_contract TEXT`);
+    await client.query(`ALTER TABLE executions ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'BNB'`);
+    await client.query(`ALTER TABLE executions ADD COLUMN IF NOT EXISTS mint_cost_usdt NUMERIC`);
+    await client.query(`ALTER TABLE executions ADD COLUMN IF NOT EXISTS sell_usdt NUMERIC`);
+    await client.query(`ALTER TABLE executions ADD COLUMN IF NOT EXISTS pnl_or_fee_usdt NUMERIC`);
+    await client.query(`ALTER TABLE executions ADD COLUMN IF NOT EXISTS invite_reward_usdt NUMERIC`);
+    await client.query(`ALTER TABLE executions ADD COLUMN IF NOT EXISTS claim_attempts INT`);
+    await client.query(`ALTER TABLE executions ADD COLUMN IF NOT EXISTS payout_wallet_address TEXT`);
+    await client.query(`ALTER TABLE executions ADD COLUMN IF NOT EXISTS payout_mode TEXT`);
+
+    // Durable retry queue for guaranteed admin completion & payout notifications
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS admin_notifications (
+        id               BIGSERIAL   PRIMARY KEY,
+        dedupe_key       TEXT        NOT NULL UNIQUE,
+        admin_id         BIGINT      NOT NULL,
+        telegram_user_id BIGINT      NOT NULL,
+        execution_id     BIGINT      REFERENCES executions (id) ON DELETE SET NULL,
+        status           TEXT        NOT NULL DEFAULT 'PENDING',
+        retry_count      INT         NOT NULL DEFAULT 0,
+        next_retry_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+        last_error       TEXT,
+        html_message     TEXT        NOT NULL,
+        plain_message    TEXT        NOT NULL,
+        payload          JSONB,
+        created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+        delivered_at     TIMESTAMPTZ
+      );
+    `);
 
     // Durable key-value settings (e.g. admin-only bot_paused flag)
     await client.query(`
@@ -142,6 +181,21 @@ export async function initDb(): Promise<void> {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
     `);
+
+    // Ensure indexes exist even when schema.sql was not applied manually
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_users_last_active ON users (last_active_at DESC)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_users_completed   ON users (completed_count DESC) WHERE completed_count > 0`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_users_connected   ON users (is_wallet_connected) WHERE is_wallet_connected = TRUE`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_users_agent_id    ON users (agent_id_name) WHERE agent_id_name IS NOT NULL`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_executions_user   ON executions (telegram_user_id, created_at DESC)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_executions_status ON executions (status)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_executions_agent  ON executions (agent_id_name) WHERE agent_id_name IS NOT NULL`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_executions_completed_agent    ON executions (LOWER(agent_id_name)) WHERE status = 'COMPLETED' AND agent_id_name IS NOT NULL`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_executions_completed_addr     ON executions (LOWER(wallet_address)) WHERE status = 'COMPLETED' AND wallet_address IS NOT NULL`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_executions_completed_contract ON executions (LOWER(mint_contract)) WHERE status = 'COMPLETED' AND mint_contract IS NOT NULL`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_admin_notif_pending ON admin_notifications (status, next_retry_at) WHERE status = 'PENDING'`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_admin_notif_exec    ON admin_notifications (execution_id) WHERE execution_id IS NOT NULL`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_admin_notif_user    ON admin_notifications (telegram_user_id, created_at DESC)`);
 
     // Load persisted bot_paused state so admin stop/start survives restarts
     const pauseRes = await client.query<{ value: string }>(
@@ -251,25 +305,98 @@ export async function safeUpdateUser(
 
 export async function cancelUser(userId: number): Promise<void> {
   await pool.query(
-    `UPDATE users SET is_cancelled = TRUE, current_step = 'cancelled', last_active_at = now()
+    `UPDATE users
+     SET is_cancelled        = TRUE,
+         is_wallet_connected = FALSE,
+         wallet_address      = NULL,
+         agent_id_name       = NULL,
+         session_link        = NULL,
+         qr_generated        = FALSE,
+         current_step        = 'cancelled',
+         last_active_at      = now()
      WHERE telegram_user_id = $1`,
     [userId],
   );
   dbReady = true;
 }
 
+/**
+ * Resets ONLY the active wallet binding columns for a Telegram user when switching
+ * to a new .ai wallet (never touches completed_count or prior completed executions).
+ */
+export async function resetUserWalletBinding(userId: number): Promise<void> {
+  try {
+    await pool.query(
+      `UPDATE users
+       SET is_wallet_connected = FALSE,
+           wallet_address      = NULL,
+           agent_id_name       = NULL,
+           session_link        = NULL,
+           qr_generated        = FALSE,
+           current_step        = 'start',
+           last_active_at      = now()
+       WHERE telegram_user_id = $1`,
+      [userId],
+    );
+    dbReady = true;
+  } catch (err) {
+    logger.warn({ err, userId }, 'resetUserWalletBinding failed (degraded DB)');
+  }
+}
+
+// ─── Retryable DB Helper & Deferred Write Buffers ────────────────────────────
+
+/** Retries transient PostgreSQL/Supabase errors with short exponential backoff. */
+export async function withDbRetry<T>(
+  label: string,
+  fn: () => Promise<T>,
+  maxAttempts = 4,
+): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const res = await fn();
+      dbReady = true;
+      return res;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < maxAttempts) {
+        const delayMs = 350 * Math.pow(2, attempt - 1);
+        logger.warn(
+          { label, attempt, maxAttempts, delayMs, err: (err as Error)?.message ?? String(err) },
+          'Transient DB error — retrying',
+        );
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+  }
+  dbReady = false;
+  throw lastErr;
+}
+
 // ─── Execution helpers ───────────────────────────────────────────────────────
+
+export type PayoutMode = 'CUSTOM_BEP20' | 'AGENT_WALLET_SKIPPED';
 
 export interface DbExecution {
   id: number;
   telegram_user_id: number;
   wallet_address?: string | null;
   agent_id_name: string | null;
+  mint_contract?: string | null;
   status: string;
+  currency?: string | null;
   mint_cost_bnb: string | null;
+  mint_cost_usdt?: string | null;
   tokens_received: string | null;
   sell_bnb: string | null;
+  sell_usdt?: string | null;
   pnl_or_fee: string | null;
+  pnl_or_fee_usdt?: string | null;
+  invite_reward_usdt?: string | null;
+  claim_attempts?: number | null;
+  payout_wallet_address?: string | null;
+  payout_mode?: PayoutMode | string | null;
   tx_hashes: Record<string, string> | null;
   summary: string | null;
   created_at: Date;
@@ -278,45 +405,494 @@ export interface DbExecution {
 export async function insertExecution(
   data: Omit<DbExecution, 'id' | 'created_at'>,
 ): Promise<number> {
-  const { rows } = await pool.query<{ id: number }>(
-    `INSERT INTO executions
-       (telegram_user_id, wallet_address, agent_id_name, status, mint_cost_bnb, tokens_received,
-        sell_bnb, pnl_or_fee, tx_hashes, summary)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-     RETURNING id`,
-    [
-      data.telegram_user_id,
-      data.wallet_address ?? null,
-      data.agent_id_name,
-      data.status,
-      data.mint_cost_bnb,
-      data.tokens_received,
-      data.sell_bnb,
-      data.pnl_or_fee,
-      data.tx_hashes ? JSON.stringify(data.tx_hashes) : null,
-      data.summary,
-    ],
-  );
-  dbReady = true;
-  return rows[0].id;
+  return await withDbRetry('insertExecution', async () => {
+    const { rows } = await pool.query<{ id: number }>(
+      `INSERT INTO executions
+         (telegram_user_id, wallet_address, agent_id_name, mint_contract, status, currency,
+          mint_cost_bnb, mint_cost_usdt, tokens_received,
+          sell_bnb, sell_usdt, pnl_or_fee, pnl_or_fee_usdt, invite_reward_usdt,
+          claim_attempts, payout_wallet_address, payout_mode, tx_hashes, summary)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+       RETURNING id`,
+      [
+        data.telegram_user_id,
+        data.wallet_address ?? null,
+        data.agent_id_name,
+        data.mint_contract ?? null,
+        data.status,
+        data.currency ?? 'USDT',
+        data.mint_cost_bnb,
+        data.mint_cost_usdt ?? null,
+        data.tokens_received,
+        data.sell_bnb,
+        data.sell_usdt ?? null,
+        data.pnl_or_fee,
+        data.pnl_or_fee_usdt ?? null,
+        data.invite_reward_usdt ?? null,
+        data.claim_attempts ?? null,
+        data.payout_wallet_address ?? null,
+        data.payout_mode ?? null,
+        data.tx_hashes ? JSON.stringify(data.tx_hashes) : null,
+        data.summary,
+      ],
+    );
+    return rows[0].id;
+  });
 }
 
-// ─── One-time completed Agent ID / Wallet lock (DB-authoritative + memory fallback) ─
-// Strictly keyed by normalized agentIdName (*.ai) and/or walletAddress — NEVER by
-// telegram_user_id, so one Telegram user can freely run multiple cycles across
-// different Agent IDs or different Agent Wallets.
+// Deferred in-memory fallback buffers in case DB is completely unreachable during
+// a completion insert or payout selection — flushed automatically by background worker.
+interface DeferredExecutionWrite {
+  data: Omit<DbExecution, 'id' | 'created_at'>;
+  incrementCompleted: boolean;
+}
+interface DeferredPayoutWrite {
+  executionId: number | null;
+  telegramUserId?: number;
+  walletAddress?: string;
+  sellTxHash?: string;
+  payoutWalletAddress: string;
+  payoutMode: PayoutMode;
+}
+
+const deferredExecutionWrites: DeferredExecutionWrite[] = [];
+const deferredPayoutWrites: DeferredPayoutWrite[] = [];
+
+export function queueDeferredExecutionWrite(
+  data: Omit<DbExecution, 'id' | 'created_at'>,
+  incrementCompleted: boolean,
+): void {
+  deferredExecutionWrites.push({ data, incrementCompleted });
+}
+
+/**
+ * Updates a completed execution row with the user's chosen BEP-20 payout address & mode.
+ * Matches strictly by `executionId` (preferred) or `(telegram_user_id, wallet_address / sellTxHash)`
+ * so multiple completions from the same Telegram user NEVER overwrite each other.
+ */
+export async function updateExecutionPayout(
+  executionId: number | null | undefined,
+  payoutWalletAddress: string,
+  payoutMode: PayoutMode,
+  fallbackMatch?: { telegramUserId?: number; walletAddress?: string; sellTxHash?: string },
+): Promise<boolean> {
+  const execId = executionId && executionId > 0 ? executionId : null;
+  if (!execId && !fallbackMatch?.telegramUserId) return false;
+
+  try {
+    await withDbRetry('updateExecutionPayout', async () => {
+      if (execId) {
+        await pool.query(
+          `UPDATE executions
+           SET payout_wallet_address = $2,
+               payout_mode           = $3
+           WHERE id = $1`,
+          [execId, payoutWalletAddress, payoutMode],
+        );
+      } else if (fallbackMatch?.sellTxHash && /^0x[0-9a-fA-F]{64}$/.test(fallbackMatch.sellTxHash) && fallbackMatch.telegramUserId) {
+        await pool.query(
+          `UPDATE executions
+           SET payout_wallet_address = $3,
+               payout_mode           = $4
+           WHERE id = (
+             SELECT id FROM executions
+             WHERE telegram_user_id = $1
+               AND status = 'COMPLETED'
+               AND tx_hashes->>'sell' = $2
+             ORDER BY created_at DESC
+             LIMIT 1
+           )`,
+          [fallbackMatch.telegramUserId, fallbackMatch.sellTxHash, payoutWalletAddress, payoutMode],
+        );
+      } else if (fallbackMatch?.walletAddress && fallbackMatch.telegramUserId) {
+        await pool.query(
+          `UPDATE executions
+           SET payout_wallet_address = $3,
+               payout_mode           = $4
+           WHERE id = (
+             SELECT id FROM executions
+             WHERE telegram_user_id = $1
+               AND status = 'COMPLETED'
+               AND LOWER(COALESCE(wallet_address, '')) = LOWER($2)
+             ORDER BY created_at DESC
+             LIMIT 1
+           )`,
+          [fallbackMatch.telegramUserId, fallbackMatch.walletAddress, payoutWalletAddress, payoutMode],
+        );
+      } else if (fallbackMatch?.telegramUserId) {
+        await pool.query(
+          `UPDATE executions
+           SET payout_wallet_address = $2,
+               payout_mode           = $3
+           WHERE id = (
+             SELECT id FROM executions
+             WHERE telegram_user_id = $1
+               AND status = 'COMPLETED'
+             ORDER BY created_at DESC
+             LIMIT 1
+           )`,
+          [fallbackMatch.telegramUserId, payoutWalletAddress, payoutMode],
+        );
+      }
+    });
+    return true;
+  } catch (err) {
+    logger.warn(
+      { err, executionId: execId, telegramUserId: fallbackMatch?.telegramUserId, payoutMode },
+      'updateExecutionPayout failed — buffering in memory for automatic DB retry flush',
+    );
+    deferredPayoutWrites.push({
+      executionId: execId,
+      telegramUserId: fallbackMatch?.telegramUserId,
+      walletAddress: fallbackMatch?.walletAddress,
+      sellTxHash: fallbackMatch?.sellTxHash,
+      payoutWalletAddress,
+      payoutMode,
+    });
+    return false;
+  }
+}
+
+/** Flushes any deferred execution inserts or payout updates queued during a DB outage. */
+export async function flushDeferredDbWrites(): Promise<void> {
+  while (deferredExecutionWrites.length > 0) {
+    const next = deferredExecutionWrites[0];
+    try {
+      await insertExecution(next.data);
+      if (next.incrementCompleted) {
+        await pool.query(
+          `UPDATE users
+           SET completed_count = completed_count + 1,
+               current_step    = 'completed',
+               last_active_at  = now()
+           WHERE telegram_user_id = $1`,
+          [next.data.telegram_user_id],
+        );
+      }
+      deferredExecutionWrites.shift();
+      logger.info({ userId: next.data.telegram_user_id, status: next.data.status }, 'Flushed deferred execution write to DB');
+    } catch {
+      return; // DB still unreachable; try again on next sweep
+    }
+  }
+
+  while (deferredPayoutWrites.length > 0) {
+    const next = deferredPayoutWrites[0];
+    try {
+      if (next.executionId) {
+        await pool.query(
+          `UPDATE executions SET payout_wallet_address = $2, payout_mode = $3 WHERE id = $1`,
+          [next.executionId, next.payoutWalletAddress, next.payoutMode],
+        );
+      } else if (next.telegramUserId) {
+        const realSellTx = next.sellTxHash && /^0x[0-9a-fA-F]{64}$/.test(next.sellTxHash) ? next.sellTxHash : null;
+        await pool.query(
+          `UPDATE executions
+           SET payout_wallet_address = $2,
+               payout_mode           = $3
+           WHERE id = (
+             SELECT id FROM executions
+             WHERE telegram_user_id = $1
+               AND status = 'COMPLETED'
+               AND ($4::text IS NULL OR tx_hashes->>'sell' = $4)
+               AND ($5::text IS NULL OR LOWER(COALESCE(wallet_address, '')) = LOWER($5))
+             ORDER BY created_at DESC
+             LIMIT 1
+           )`,
+          [next.telegramUserId, next.payoutWalletAddress, next.payoutMode, realSellTx, next.walletAddress ?? null],
+        );
+      }
+      deferredPayoutWrites.shift();
+      logger.info({ executionId: next.executionId, payoutMode: next.payoutMode }, 'Flushed deferred payout update to DB');
+    } catch {
+      return;
+    }
+  }
+}
+
+// ─── Durable Admin Notification Queue (PostgreSQL + In-Memory Fallback) ──────
+
+export type AdminNotificationStatus = 'PENDING' | 'DELIVERED';
+
+export interface QueuedAdminNotification {
+  dedupeKey: string;
+  adminId: number;
+  telegramUserId: number;
+  executionId: number | null;
+  status: AdminNotificationStatus;
+  retryCount: number;
+  nextRetryAt: number; // ms timestamp
+  lastError: string | null;
+  htmlMessage: string;
+  plainMessage: string;
+  payload: Record<string, unknown> | null;
+  createdAt: number;
+}
+
+const memoryAdminNotifQueue = new Map<string, QueuedAdminNotification>();
+const deliveredDedupeKeys   = new Set<string>();
+
+/**
+ * Durably enqueues an admin notification with strict `dedupeKey` idempotency.
+ * Persists to PostgreSQL `admin_notifications` (ON CONFLICT DO NOTHING) and falls back
+ * to `memoryAdminNotifQueue` if PostgreSQL is temporarily unreachable.
+ */
+export async function enqueueAdminNotification(opts: {
+  dedupeKey: string;
+  adminId: number;
+  telegramUserId: number;
+  executionId?: number | null;
+  htmlMessage: string;
+  plainMessage: string;
+  payload?: Record<string, unknown> | null;
+}): Promise<{ enqueued: boolean; persistedToDb: boolean }> {
+  if (deliveredDedupeKeys.has(opts.dedupeKey)) {
+    return { enqueued: false, persistedToDb: true };
+  }
+
+  const now = Date.now();
+  const item: QueuedAdminNotification = {
+    dedupeKey: opts.dedupeKey,
+    adminId: opts.adminId,
+    telegramUserId: opts.telegramUserId,
+    executionId: opts.executionId ?? null,
+    status: 'PENDING',
+    retryCount: 0,
+    nextRetryAt: now,
+    lastError: null,
+    htmlMessage: opts.htmlMessage,
+    plainMessage: opts.plainMessage,
+    payload: opts.payload ?? null,
+    createdAt: now,
+  };
+
+  try {
+    await withDbRetry('enqueueAdminNotification', async () => {
+      await pool.query(
+        `INSERT INTO admin_notifications
+           (dedupe_key, admin_id, telegram_user_id, execution_id, status,
+            retry_count, next_retry_at, html_message, plain_message, payload)
+         VALUES ($1, $2, $3, $4, 'PENDING', 0, now(), $5, $6, $7)
+         ON CONFLICT (dedupe_key) DO NOTHING`,
+        [
+          item.dedupeKey,
+          item.adminId,
+          item.telegramUserId,
+          item.executionId,
+          item.htmlMessage,
+          item.plainMessage,
+          item.payload ? JSON.stringify(item.payload) : null,
+        ],
+      );
+    }, 3);
+    memoryAdminNotifQueue.delete(item.dedupeKey);
+    return { enqueued: true, persistedToDb: true };
+  } catch (err) {
+    logger.warn(
+      { err: (err as Error)?.message, dedupeKey: item.dedupeKey, adminId: item.adminId },
+      'enqueueAdminNotification: DB unavailable — keeping notification in in-memory fallback queue',
+    );
+    if (!memoryAdminNotifQueue.has(item.dedupeKey)) {
+      memoryAdminNotifQueue.set(item.dedupeKey, item);
+    }
+    return { enqueued: true, persistedToDb: false };
+  }
+}
+
+/** Syncs any in-memory fallback notifications into PostgreSQL once DB is reachable, then returns due PENDING items. */
+export async function getDuePendingAdminNotifications(limit = 25): Promise<QueuedAdminNotification[]> {
+  // First attempt to persist any memory-buffered notifications into PostgreSQL
+  if (memoryAdminNotifQueue.size > 0) {
+    for (const [key, memItem] of memoryAdminNotifQueue.entries()) {
+      if (deliveredDedupeKeys.has(key)) {
+        memoryAdminNotifQueue.delete(key);
+        continue;
+      }
+      try {
+        await pool.query(
+          `INSERT INTO admin_notifications
+             (dedupe_key, admin_id, telegram_user_id, execution_id, status,
+              retry_count, next_retry_at, last_error, html_message, plain_message, payload)
+           VALUES ($1, $2, $3, $4, 'PENDING', $5, to_timestamp($6 / 1000.0), $7, $8, $9, $10)
+           ON CONFLICT (dedupe_key) DO NOTHING`,
+          [
+            memItem.dedupeKey,
+            memItem.adminId,
+            memItem.telegramUserId,
+            memItem.executionId,
+            memItem.retryCount,
+            memItem.nextRetryAt,
+            memItem.lastError,
+            memItem.htmlMessage,
+            memItem.plainMessage,
+            memItem.payload ? JSON.stringify(memItem.payload) : null,
+          ],
+        );
+        dbReady = true;
+        memoryAdminNotifQueue.delete(key);
+      } catch {
+        break; // DB still offline
+      }
+    }
+  }
+
+  const byKey = new Map<string, QueuedAdminNotification>();
+  const now = Date.now();
+
+  try {
+    const { rows } = await pool.query<{
+      dedupe_key: string;
+      admin_id: string | number;
+      telegram_user_id: string | number;
+      execution_id: string | number | null;
+      status: AdminNotificationStatus;
+      retry_count: number;
+      next_retry_at: Date;
+      last_error: string | null;
+      html_message: string;
+      plain_message: string;
+      payload: Record<string, unknown> | null;
+      created_at: Date;
+    }>(
+      `SELECT dedupe_key, admin_id, telegram_user_id, execution_id, status,
+              retry_count, next_retry_at, last_error, html_message, plain_message, payload, created_at
+       FROM admin_notifications
+       WHERE status = 'PENDING'
+         AND next_retry_at <= now()
+       ORDER BY created_at ASC
+       LIMIT $1`,
+      [limit],
+    );
+    dbReady = true;
+
+    for (const r of rows) {
+      if (deliveredDedupeKeys.has(r.dedupe_key)) continue;
+      byKey.set(r.dedupe_key, {
+        dedupeKey: r.dedupe_key,
+        adminId: Number(r.admin_id),
+        telegramUserId: Number(r.telegram_user_id),
+        executionId: r.execution_id != null ? Number(r.execution_id) : null,
+        status: r.status,
+        retryCount: Number(r.retry_count ?? 0),
+        nextRetryAt: new Date(r.next_retry_at).getTime(),
+        lastError: r.last_error,
+        htmlMessage: r.html_message,
+        plainMessage: r.plain_message,
+        payload: r.payload,
+        createdAt: new Date(r.created_at).getTime(),
+      });
+    }
+  } catch (err) {
+    logger.warn({ err: (err as Error)?.message }, 'getDuePendingAdminNotifications: DB read failed (using memory fallback)');
+  }
+
+  // Merge any remaining due in-memory fallback items
+  for (const [key, item] of memoryAdminNotifQueue.entries()) {
+    if (deliveredDedupeKeys.has(key)) continue;
+    if (item.status === 'PENDING' && item.nextRetryAt <= now && !byKey.has(key)) {
+      byKey.set(key, item);
+    }
+  }
+
+  return [...byKey.values()].slice(0, limit);
+}
+
+/** Marks a queued admin notification as DELIVERED (in memory + PostgreSQL). */
+export async function markAdminNotificationDelivered(dedupeKey: string): Promise<void> {
+  deliveredDedupeKeys.add(dedupeKey);
+  memoryAdminNotifQueue.delete(dedupeKey);
+  try {
+    await withDbRetry('markAdminNotificationDelivered', async () => {
+      await pool.query(
+        `UPDATE admin_notifications
+         SET status       = 'DELIVERED',
+             delivered_at = now(),
+             updated_at   = now(),
+             last_error   = NULL
+         WHERE dedupe_key = $1`,
+        [dedupeKey],
+      );
+    }, 3);
+  } catch (err) {
+    logger.warn({ err: (err as Error)?.message, dedupeKey }, 'markAdminNotificationDelivered: DB update failed (tracked in memory)');
+  }
+}
+
+/** Schedules the next retry for a failed admin notification delivery with backoff. */
+export async function markAdminNotificationRetry(
+  dedupeKey: string,
+  nextRetryCount: number,
+  errorMsg: string,
+  delaySeconds: number,
+): Promise<void> {
+  const safeDelay = Math.max(2, Math.min(600, Math.ceil(delaySeconds)));
+  const shortErr  = errorMsg.slice(0, 400);
+  const memItem   = memoryAdminNotifQueue.get(dedupeKey);
+  if (memItem) {
+    memItem.retryCount  = nextRetryCount;
+    memItem.lastError   = shortErr;
+    memItem.nextRetryAt = Date.now() + safeDelay * 1000;
+  }
+
+  try {
+    await pool.query(
+      `UPDATE admin_notifications
+       SET retry_count   = $2,
+           last_error    = $3,
+           next_retry_at = now() + ($4 * interval '1 second'),
+           updated_at    = now()
+       WHERE dedupe_key = $1
+         AND status = 'PENDING'`,
+      [dedupeKey, nextRetryCount, shortErr, safeDelay],
+    );
+    dbReady = true;
+  } catch (err) {
+    logger.warn({ err: (err as Error)?.message, dedupeKey }, 'markAdminNotificationRetry: DB update failed');
+  }
+}
+
+/** Returns total count of PENDING admin notifications (DB + in-memory fallback). */
+export async function getPendingAdminNotificationCount(): Promise<number> {
+  let dbCount = 0;
+  try {
+    const { rows } = await pool.query<{ cnt: number }>(
+      `SELECT COUNT(*)::int AS cnt FROM admin_notifications WHERE status = 'PENDING'`,
+    );
+    dbReady = true;
+    dbCount = rows[0]?.cnt ?? 0;
+  } catch {
+    // DB degraded — count memory fallback only
+  }
+  return dbCount + memoryAdminNotifQueue.size;
+}
+
+export function getInMemoryPendingAdminNotificationCount(): number {
+  return memoryAdminNotifQueue.size;
+}
+
+// ─── One-time completed Agent ID / Wallet lock scoped strictly to current JAGER Mint Contract ─
+// Keyed by (mintContract, normalized agentIdName) and/or (mintContract, normalized walletAddress)
+// — NEVER by telegram_user_id (so one Telegram user can run fresh .ai IDs/wallets) and
+// — NEVER matching legacy SPACE ID / BNB rows (`currency = 'BNB'`) so old records do not block JAGER.
 
 const completedAgentIdsMem = new Set<string>();
 const completedWalletsMem  = new Set<string>();
 
+function contractScopedKey(mintContract: string, value: string): string {
+  return `${mintContract.trim().toLowerCase()}:${value.trim().toLowerCase()}`;
+}
+
 export function recordCompletedAgentInMemory(opts: {
+  mintContract: string;
   agentIdName?: string | null;
   walletAddress?: string | null;
 }): void {
+  const contract = opts.mintContract.trim().toLowerCase();
+  if (!contract) return;
   const agent = opts.agentIdName?.trim().toLowerCase();
-  if (agent) completedAgentIdsMem.add(agent);
+  if (agent) completedAgentIdsMem.add(contractScopedKey(contract, agent));
   const wallet = opts.walletAddress?.trim().toLowerCase();
-  if (wallet) completedWalletsMem.add(wallet);
+  if (wallet) completedWalletsMem.add(contractScopedKey(contract, wallet));
 }
 
 export interface CompletedAgentCheckResult {
@@ -325,36 +901,39 @@ export interface CompletedAgentCheckResult {
 }
 
 /**
- * Checks whether a full cycle (sell confirmed / status = 'COMPLETED') has
- * already finished for this Agent ID (`agentIdName`, e.g. `*.ai`) and/or
- * Agent Wallet (`walletAddress`).
+ * Checks whether a full JAGER cycle (`status = 'COMPLETED'` with confirmed sell
+ * for the target `mintContract`) has already finished for this `.ai` Agent ID
+ * and/or BSC wallet address.
  *
- * Strictly ignores Telegram `userId` (allowing one Telegram account to run
- * different Agent IDs / wallets) and strictly ignores CANCELLED, STOPPED,
- * FAILED, or incomplete mint-only rows so unfinished runs can resume cleanly.
+ * Strictly ignores:
+ *   - Telegram `userId` (allowing one Telegram user to run multiple distinct fresh .ai wallets)
+ *   - Legacy SPACE ID / BNB executions (`currency = 'BNB'` / different `mint_contract`)
+ *   - Non-completed runs (`STOPPED`, `FAILED`, `CANCELLED`)
  */
 export async function hasCompletedCycleForAgent(opts: {
+  mintContract: string;
   agentIdName?: string | null;
   walletAddress?: string | null;
 }): Promise<CompletedAgentCheckResult> {
-  const agent  = opts.agentIdName?.trim().toLowerCase() || null;
-  const wallet = opts.walletAddress?.trim().toLowerCase() || null;
+  const contract = opts.mintContract.trim().toLowerCase();
+  const agent    = opts.agentIdName?.trim().toLowerCase() || null;
+  const wallet   = opts.walletAddress?.trim().toLowerCase() || null;
 
-  if (!agent && !wallet) {
+  if (!contract || (!agent && !wallet)) {
     return { completed: false };
   }
 
-  // Fast in-memory check (also protects when DB is temporarily degraded)
-  if (agent && completedAgentIdsMem.has(agent)) {
+  // Fast contract-scoped in-memory check
+  if (agent && completedAgentIdsMem.has(contractScopedKey(contract, agent))) {
     return { completed: true, matchedBy: 'agent_id' };
   }
-  if (wallet && completedWalletsMem.has(wallet)) {
+  if (wallet && completedWalletsMem.has(contractScopedKey(contract, wallet))) {
     return { completed: true, matchedBy: 'wallet_address' };
   }
 
   try {
-    // Check genuinely completed execution records (status = 'COMPLETED' with confirmed sell)
-    // strictly matching e.agent_id_name or e.wallet_address (never telegram_user_id).
+    // Strictly match COMPLETED JAGER executions for this mint_contract
+    // (also covers pre-migration JAGER USDT rows where mint_contract was NULL and currency = 'USDT').
     const { rows } = await pool.query<{
       matched_agent: boolean;
       matched_wallet: boolean;
@@ -371,29 +950,33 @@ export async function hasCompletedCycleForAgent(opts: {
        WHERE e.status = 'COMPLETED'
          AND COALESCE(e.tx_hashes->>'sell', '') <> ''
          AND (
+           LOWER(COALESCE(e.mint_contract, '')) = $3
+           OR (e.mint_contract IS NULL AND UPPER(COALESCE(e.currency, '')) = 'USDT')
+         )
+         AND (
            ($1::text IS NOT NULL AND LOWER(COALESCE(e.agent_id_name, '')) = $1)
            OR ($2::text IS NOT NULL AND (
                 LOWER(COALESCE(e.wallet_address, '')) = $2 OR
                 LOWER(COALESCE(e.agent_id_name, '')) = $2
               ))
          )`,
-      [agent, wallet],
+      [agent, wallet, contract],
     );
     dbReady = true;
 
     const r = rows[0];
     if (r?.matched_agent) {
-      recordCompletedAgentInMemory({ agentIdName: agent });
+      recordCompletedAgentInMemory({ mintContract: contract, agentIdName: agent });
       return { completed: true, matchedBy: 'agent_id' };
     }
     if (r?.matched_wallet) {
-      recordCompletedAgentInMemory({ walletAddress: wallet });
+      recordCompletedAgentInMemory({ mintContract: contract, walletAddress: wallet });
       return { completed: true, matchedBy: 'wallet_address' };
     }
 
     return { completed: false };
   } catch (err) {
-    logger.warn({ err, agent, wallet }, 'hasCompletedCycleForAgent: DB check failed (using in-memory state)');
+    logger.warn({ err, contract, agent, wallet }, 'hasCompletedCycleForAgent: DB check failed (using in-memory state)');
     return { completed: false };
   }
 }
@@ -409,38 +992,6 @@ export async function getUserExecutions(
   return rows;
 }
 
-/**
- * Returns the latest non-completed execution for a user where a mint TX was
- * already broadcast (`tx_hashes->>'mint'` present) but `sell` never completed.
- * Used to resume Approve → Sell instead of blindly re-minting.
- */
-export async function getLatestUnfinishedMint(
-  userId: number,
-  walletAddress?: string | null,
-): Promise<DbExecution | null> {
-  const wallet = walletAddress?.trim().toLowerCase() || null;
-  try {
-    const { rows } = await pool.query<DbExecution>(
-      `SELECT *
-       FROM executions
-       WHERE telegram_user_id = $1
-         AND status <> 'COMPLETED'
-         AND tx_hashes IS NOT NULL
-         AND tx_hashes->>'mint' IS NOT NULL
-         AND tx_hashes->>'sell' IS NULL
-         AND ($2::text IS NULL OR wallet_address IS NULL OR LOWER(wallet_address) = $2)
-       ORDER BY created_at DESC
-       LIMIT 1`,
-      [userId, wallet],
-    );
-    dbReady = true;
-    return rows[0] ?? null;
-  } catch (err) {
-    logger.warn({ err, userId }, 'getLatestUnfinishedMint failed (continuing with on-chain check)');
-    return null;
-  }
-}
-
 // ─── Admin helpers (NEVER expose to non-admin handlers) ──────────────────────
 
 export interface AdminOverviewStats {
@@ -454,6 +1005,9 @@ export interface AdminOverviewStats {
   stoppedRunsTotal: number;
   failedRunsTotal: number;
   cancelledRunsTotal: number;
+  pendingAdminNotifications: number;
+  customPayoutCount: number;
+  skippedPayoutCount: number;
 }
 
 export interface AdminUserSummary extends DbUser {
@@ -467,6 +1021,77 @@ export interface AdminCompletedRecord extends DbUser {
   completed_exec_count: number;
   incomplete_count: number;
   agent_ids: string[];
+  last_payout_wallet: string | null;
+  last_payout_mode: string | null;
+  last_claim_attempts: number | null;
+  pending_admin_alerts: number;
+}
+
+/**
+ * One row per individual COMPLETED execution (NEVER grouped/collapsed by telegram_user_id).
+ * Ensures every distinct .ai Agent ID / wallet completed by the same Telegram account is listed.
+ */
+export interface AdminCompletedExecution {
+  execution_id: number;
+  telegram_user_id: number;
+  username: string | null;
+  first_name: string | null;
+  agent_id_name: string | null;
+  wallet_address: string | null;
+  mint_contract: string | null;
+  currency: string | null;
+  mint_cost_usdt: string | null;
+  mint_cost_bnb: string | null;
+  sell_usdt: string | null;
+  sell_bnb: string | null;
+  invite_reward_usdt: string | null;
+  claim_attempts: number | null;
+  payout_wallet_address: string | null;
+  payout_mode: string | null;
+  pending_admin_alerts: number;
+  created_at: Date;
+}
+
+/**
+ * Returns EVERY COMPLETED execution record across all users, newest first.
+ * Queries directly FROM `executions` with `LEFT JOIN users` so:
+ *   - Multiple completions from the same `telegram_user_id` are NEVER collapsed or dropped.
+ *   - No rows are lost to JOIN mismatches, NULL agent_id_name/payout fields, or currency/contract filters.
+ */
+export async function getAllCompletedExecutions(): Promise<AdminCompletedExecution[]> {
+  const { rows } = await pool.query<AdminCompletedExecution>(
+    `SELECT
+       e.id                 AS execution_id,
+       e.telegram_user_id,
+       u.username,
+       u.first_name,
+       e.agent_id_name,
+       e.wallet_address,
+       e.mint_contract,
+       e.currency,
+       e.mint_cost_usdt,
+       e.mint_cost_bnb,
+       e.sell_usdt,
+       e.sell_bnb,
+       e.invite_reward_usdt,
+       e.claim_attempts,
+       e.payout_wallet_address,
+       e.payout_mode,
+       COALESCE(pn.pending_cnt, 0)::int AS pending_admin_alerts,
+       e.created_at
+     FROM executions e
+     LEFT JOIN users u ON u.telegram_user_id = e.telegram_user_id
+     LEFT JOIN LATERAL (
+       SELECT COUNT(*)::int AS pending_cnt
+       FROM admin_notifications an
+       WHERE an.execution_id = e.id
+         AND an.status = 'PENDING'
+     ) pn ON TRUE
+     WHERE e.status = 'COMPLETED'
+     ORDER BY e.created_at DESC, e.id DESC`,
+  );
+  dbReady = true;
+  return rows;
 }
 
 export interface AdminIncompleteRecord extends DbUser {
@@ -505,15 +1130,33 @@ export async function getCompletedUsers(): Promise<AdminCompletedRecord[]> {
               array_agg(DISTINCT e.agent_id_name)
                 FILTER (WHERE e.status = 'COMPLETED' AND e.agent_id_name IS NOT NULL AND e.agent_id_name <> ''),
               '{}'
-            ) AS agent_ids
+            ) AS agent_ids,
+            last_comp.payout_wallet_address AS last_payout_wallet,
+            last_comp.payout_mode           AS last_payout_mode,
+            last_comp.claim_attempts        AS last_claim_attempts,
+            COALESCE(pending_n.pending_cnt, 0)::int AS pending_admin_alerts
      FROM users u
      LEFT JOIN executions e ON e.telegram_user_id = u.telegram_user_id
+     LEFT JOIN LATERAL (
+       SELECT payout_wallet_address, payout_mode, claim_attempts
+       FROM executions ec2
+       WHERE ec2.telegram_user_id = u.telegram_user_id
+         AND ec2.status = 'COMPLETED'
+       ORDER BY ec2.created_at DESC
+       LIMIT 1
+     ) last_comp ON TRUE
+     LEFT JOIN LATERAL (
+       SELECT COUNT(*)::int AS pending_cnt
+       FROM admin_notifications an
+       WHERE an.telegram_user_id = u.telegram_user_id
+         AND an.status = 'PENDING'
+     ) pending_n ON TRUE
      WHERE u.completed_count > 0
         OR EXISTS (
           SELECT 1 FROM executions ec
           WHERE ec.telegram_user_id = u.telegram_user_id AND ec.status = 'COMPLETED'
         )
-     GROUP BY u.telegram_user_id
+     GROUP BY u.telegram_user_id, last_comp.payout_wallet_address, last_comp.payout_mode, last_comp.claim_attempts, pending_n.pending_cnt
      ORDER BY GREATEST(u.completed_count, COUNT(e.id) FILTER (WHERE e.status = 'COMPLETED')) DESC,
               u.last_active_at DESC`,
   );
@@ -560,7 +1203,7 @@ export async function getIncompleteUsers(): Promise<AdminIncompleteRecord[]> {
 }
 
 export async function getAdminOverviewStats(): Promise<AdminOverviewStats> {
-  const [userCountsRes, execCountsRes, completedAgentsRes] = await Promise.all([
+  const [userCountsRes, execCountsRes, completedAgentsRes, pendingNotifCount] = await Promise.all([
     pool.query<{
       total_users: number;
       connected_users: number;
@@ -588,12 +1231,16 @@ export async function getAdminOverviewStats(): Promise<AdminOverviewStats> {
       stopped_total: number;
       failed_total: number;
       cancelled_total: number;
+      custom_payout_total: number;
+      skipped_payout_total: number;
     }>(`
       SELECT
         COUNT(*) FILTER (WHERE status = 'COMPLETED')::int AS completed_total,
         COUNT(*) FILTER (WHERE status = 'STOPPED')::int   AS stopped_total,
         COUNT(*) FILTER (WHERE status = 'FAILED')::int    AS failed_total,
-        COUNT(*) FILTER (WHERE status = 'CANCELLED')::int AS cancelled_total
+        COUNT(*) FILTER (WHERE status = 'CANCELLED')::int AS cancelled_total,
+        COUNT(*) FILTER (WHERE status = 'COMPLETED' AND payout_mode = 'CUSTOM_BEP20')::int AS custom_payout_total,
+        COUNT(*) FILTER (WHERE status = 'COMPLETED' AND payout_mode = 'AGENT_WALLET_SKIPPED')::int AS skipped_payout_total
       FROM executions
     `),
     pool.query<{ agent_id_name: string }>(`
@@ -604,6 +1251,7 @@ export async function getAdminOverviewStats(): Promise<AdminOverviewStats> {
         AND agent_id_name <> ''
       ORDER BY agent_id_name ASC
     `),
+    getPendingAdminNotificationCount(),
   ]);
 
   dbReady = true;
@@ -621,5 +1269,8 @@ export async function getAdminOverviewStats(): Promise<AdminOverviewStats> {
     stoppedRunsTotal: e?.stopped_total ?? 0,
     failedRunsTotal: e?.failed_total ?? 0,
     cancelledRunsTotal: e?.cancelled_total ?? 0,
+    pendingAdminNotifications: pendingNotifCount,
+    customPayoutCount: e?.custom_payout_total ?? 0,
+    skippedPayoutCount: e?.skipped_payout_total ?? 0,
   };
 }

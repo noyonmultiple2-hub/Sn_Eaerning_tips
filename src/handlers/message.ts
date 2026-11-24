@@ -5,10 +5,11 @@ import { Context } from 'telegraf';
 import { routeIntent } from '../gemini.js';
 import { handleConnectWallet } from './wallet.js';
 import { handleGenerateQr } from './qr.js';
-import { handleCompleteProcess } from './execute.js';
+import { handleCompleteProcess, handlePayoutWalletInput } from './execute.js';
 import { handleMyJobs } from './jobs.js';
 import { handleCancel } from './cancel.js';
 import { KB } from '../keyboards.js';
+import { isAdminId } from '../config.js';
 
 export async function handleMessage(ctx: Context): Promise<void> {
   const text = (ctx.message as { text?: string })?.text;
@@ -16,6 +17,9 @@ export async function handleMessage(ctx: Context): Promise<void> {
 
   // Skip commands — they have dedicated handlers
   if (text.startsWith('/')) return;
+
+  // Capture pasted BEP-20 payment wallet address (or typed Skip) before Gemini routing
+  if (await handlePayoutWalletInput(ctx, text)) return;
 
   const result = await routeIntent(text);
 
@@ -38,7 +42,7 @@ export async function handleMessage(ctx: Context): Promise<void> {
       // Always send AI-generated text as plain text.
       await ctx.reply(
         result.reply ?? 'How can I help you? Use the buttons below.',
-        KB.start,
+        isAdminId(ctx.from?.id) ? KB.startForAdmin : KB.start,
       );
   }
 }

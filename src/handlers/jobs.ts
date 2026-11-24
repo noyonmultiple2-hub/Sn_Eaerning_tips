@@ -16,6 +16,16 @@ async function safeAnswerCb(ctx: Context, text?: string): Promise<void> {
   }
 }
 
+function formatAmount(raw: string | null | undefined, maxDecimals = 4): string {
+  if (!raw) return '?';
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return raw;
+  return n.toLocaleString('en-US', {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: maxDecimals,
+  });
+}
+
 function formatDate(d: Date | string | null | undefined): string {
   if (!d) return '?';
   try {
@@ -97,9 +107,12 @@ export async function handleMyJobs(ctx: Context): Promise<void> {
     lines.push(``);
     lines.push(`📋 Recent completed runs (last ${Math.min(5, completed.length)}):`);
     completed.slice(0, 5).forEach((e, i) => {
+      const unit     = e.currency === 'BNB' ? 'BNB' : 'USDT';
+      const mintCost = formatAmount(e.mint_cost_usdt ?? e.mint_cost_bnb, unit === 'BNB' ? 6 : 4);
+      const sellVal  = formatAmount(e.sell_usdt ?? e.sell_bnb, unit === 'BNB' ? 6 : 4);
       lines.push(
         `  ${i + 1}. ${e.agent_id_name ?? '?'} — ` +
-        `${e.mint_cost_bnb ?? '?'} BNB → ${e.sell_bnb ?? '?'} BNB (${formatDate(e.created_at)})`,
+        `${mintCost} ${unit} → ${sellVal} ${unit} (${formatDate(e.created_at)})`,
       );
     });
   }

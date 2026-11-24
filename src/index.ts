@@ -2,15 +2,30 @@
 import { Telegraf } from 'telegraf';
 import http from 'http';
 import { config, isAdminId } from './config.js';
-import { initDb, isDbAvailable, isBotPaused, pool } from './db.js';
+import {
+  initDb,
+  isDbAvailable,
+  isBotPaused,
+  getInMemoryPendingAdminNotificationCount,
+  pool,
+} from './db.js';
+import {
+  startAdminNotificationWorker,
+  stopAdminNotificationWorker,
+} from './notifications.js';
 import { bawAvailable, getBawBinPath } from './wallet.js';
 import { ADDR, REFERRER_NAME } from './bsc.js';
 import { logger } from './logger.js';
 
 import { handleStart }         from './handlers/start.js';
-import { handleConnectWallet } from './handlers/wallet.js';
+import { handleConnectWallet, handleSwitchWallet } from './handlers/wallet.js';
 import { handleGenerateQr }    from './handlers/qr.js';
-import { handleCompleteProcess } from './handlers/execute.js';
+import {
+  handleCompleteProcess,
+  handleConfirmExecuteCycle,
+  handleCancelPreview,
+  handleSkipPayoutWallet,
+} from './handlers/execute.js';
 import { handleMyJobs }        from './handlers/jobs.js';
 import { handleCancel }        from './handlers/cancel.js';
 import {
@@ -47,6 +62,7 @@ bot.use(async (ctx, next) => {
 // ── Commands ─────────────────────────────────────────────────────────────────
 bot.start(handleStart);
 bot.command('connect',          handleConnectWallet);   // /connect alias
+bot.command('switch_wallet',    handleSwitchWallet);    // Disconnect current wallet & pair next .ai ID
 bot.command('mint',             handleCompleteProcess); // /mint alias
 bot.command('status',           handleMyJobs);          // Personal status & incomplete/completed counts
 bot.command('my_jobs',          handleMyJobs);          // Personal status alias
@@ -62,11 +78,15 @@ bot.command('admin_start',      handleAdminBotStart);
 bot.command('start_bot',        handleAdminBotStart);
 
 // ── Inline button handlers ───────────────────────────────────────────────────
-bot.action('connect_wallet',   handleConnectWallet);
-bot.action('generate_qr',      handleGenerateQr);
-bot.action('complete_process', handleCompleteProcess);
-bot.action('my_jobs',          handleMyJobs);
-bot.action('cancel',           handleCancel);
+bot.action('connect_wallet',        handleConnectWallet);
+bot.action('switch_wallet',         handleSwitchWallet);
+bot.action('generate_qr',           handleGenerateQr);
+bot.action('complete_process',      handleCompleteProcess);
+bot.action('confirm_execute_cycle', handleConfirmExecuteCycle);
+bot.action('cancel_preview',        handleCancelPreview);
+bot.action('skip_payout_wallet',    handleSkipPayoutWallet);
+bot.action('my_jobs',               handleMyJobs);
+bot.action('cancel',                handleCancel);
 
 // Admin-only inline button callbacks (strictly gated inside handlers)
 bot.action('admin_overview',   handleAdminOverview);
@@ -93,6 +113,7 @@ const healthServer = http.createServer((req, res) => {
       botMode: isBotPaused() ? 'stopped_admin_only' : 'running',
       db: isDbAvailable() ? 'connected' : 'degraded',
       baw: bawAvailable() ? 'ready' : 'missing',
+      pendingAdminAlertsMem: getInMemoryPendingAdminNotificationCount(),
       uptime: Math.floor(process.uptime()),
     }));
   } else {
@@ -136,11 +157,13 @@ async function main(): Promise<void> {
     logger.info({ port: config.PORT }, 'Health server listening'),
   );
   await bot.launch({ allowedUpdates: ['message', 'callback_query'] });
+  startAdminNotificationWorker(bot.telegram);
   logger.info('Bot running (long polling)');
 }
 
 function shutdown(signal: string): void {
   logger.info({ signal }, 'Shutting down…');
+  stopAdminNotificationWorker();
   bot.stop(signal);
   healthServer.close(() =>
     pool.end().then(() => {
