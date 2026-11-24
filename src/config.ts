@@ -16,7 +16,7 @@ function parseAdminIds(rawList: string[]): number[] {
   const ids = new Set<number>();
   for (const raw of rawList) {
     if (!raw) continue;
-    for (const part of raw.split(',')) {
+    for (const part of raw.split(/[\s,;]+/)) {
       const trimmed = part.trim();
       if (!trimmed) continue;
       if (!/^\d+$/.test(trimmed)) {
@@ -37,11 +37,13 @@ const REQUIRED_VARS = [
   'GEMINI_API_KEY',
   'TELEGRAM_BOT_TOKEN',
   'SUPABASE_DB_URL',
-  'ADMIN_ID',
   'BSC_RPC_URL',
 ] as const;
 
-const missing = REQUIRED_VARS.filter((name) => !process.env[name]?.trim());
+const missing: string[] = REQUIRED_VARS.filter((name) => !process.env[name]?.trim());
+if (!process.env.ADMIN_ID?.trim() && !process.env.ADMIN_IDS?.trim()) {
+  missing.push('ADMIN_ID (or ADMIN_IDS)');
+}
 if (missing.length > 0) {
   throw new Error(
     `Missing required environment variable(s): ${missing.join(', ')}. ` +
@@ -55,7 +57,7 @@ const adminIds = parseAdminIds([
 ]);
 
 if (adminIds.length === 0) {
-  throw new Error('ADMIN_ID must include at least one valid numeric Telegram user ID');
+  throw new Error('ADMIN_ID / ADMIN_IDS must include at least one valid numeric Telegram user ID');
 }
 
 const rawPort = optionalEnv('PORT', '3000');

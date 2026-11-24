@@ -992,6 +992,41 @@ export async function getUserExecutions(
   return rows;
 }
 
+/**
+ * Recovers a pending payout prompt across bot restarts: if a user is in
+ * `current_step = 'awaiting_payout_wallet'` and has a COMPLETED execution with
+ * `payout_wallet_address IS NULL`, returns that execution plus the user's current
+ * `completed_count` so pasted BEP-20 addresses or Skip clicks still finalize cleanly.
+ */
+export async function getPendingPayoutExecution(
+  userId: number,
+): Promise<{ execution: DbExecution; completedCount: number } | null> {
+  try {
+    const { rows } = await pool.query<DbExecution & { user_completed_count: number }>(
+      `SELECT e.*, u.completed_count AS user_completed_count
+       FROM users u
+       INNER JOIN executions e ON e.telegram_user_id = u.telegram_user_id
+       WHERE u.telegram_user_id = $1
+         AND u.current_step = 'awaiting_payout_wallet'
+         AND e.status = 'COMPLETED'
+         AND e.payout_wallet_address IS NULL
+       ORDER BY e.created_at DESC, e.id DESC
+       LIMIT 1`,
+      [userId],
+    );
+    dbReady = true;
+    const row = rows[0];
+    if (!row) return null;
+    return {
+      execution: row,
+      completedCount: Math.max(1, Number(row.user_completed_count ?? 1)),
+    };
+  } catch (err) {
+    logger.warn({ err: (err as Error)?.message, userId }, 'getPendingPayoutExecution: DB read failed');
+    return null;
+  }
+}
+
 // ─── Admin helpers (NEVER expose to non-admin handlers) ──────────────────────
 
 export interface AdminOverviewStats {

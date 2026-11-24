@@ -28,6 +28,8 @@ const MAX_BACKOFF_SEC   = 300;    // cap retry backoff at 5 minutes
 let workerTelegram: Telegram | null = null;
 let flushTimer: NodeJS.Timeout | null = null;
 let isFlushing = false;
+let pendingReflush = false;
+let pendingReflushTelegram: Telegram | null = null;
 const inFlightKeys = new Set<string>();
 
 /** Computes retry delay in seconds, honoring Telegram `retry_after` on 429 rate limits. */
@@ -117,28 +119,51 @@ async function deliverOne(telegram: Telegram, item: QueuedAdminNotification): Pr
 
 /**
  * Flushes deferred DB writes and retries all due PENDING admin notifications.
- * Safe to call concurrently (guarded by single-flight `isFlushing`).
+ * Safe to call concurrently: if a flush is already running when new alerts are
+ * enqueued, it flags `pendingReflush` so newly enqueued alerts are delivered
+ * immediately instead of waiting for the next 15s timer tick.
  */
 export async function flushPendingAdminNotifications(telegram?: Telegram): Promise<number> {
   const tg = telegram ?? workerTelegram;
-  if (!tg || isFlushing) return 0;
+  if (!tg) return 0;
+
+  if (isFlushing) {
+    pendingReflush = true;
+    pendingReflushTelegram = tg;
+    return 0;
+  }
 
   isFlushing = true;
   let deliveredCount = 0;
-  try {
-    // 1. Flush any execution/payout DB writes buffered during a transient DB outage
-    await flushDeferredDbWrites();
+  let activeTg: Telegram = tg;
 
-    // 2. Deliver all due PENDING admin notifications
-    const due = await getDuePendingAdminNotifications(25);
-    for (const item of due) {
-      const ok = await deliverOne(tg, item);
-      if (ok) deliveredCount++;
-    }
+  try {
+    do {
+      pendingReflush = false;
+      // 1. Flush any execution/payout DB writes buffered during a transient DB outage
+      await flushDeferredDbWrites();
+
+      // 2. Deliver all due PENDING admin notifications (drain batches up to 4 passes per flush)
+      for (let batch = 0; batch < 4; batch++) {
+        const due = await getDuePendingAdminNotifications(25);
+        if (due.length === 0) break;
+        for (const item of due) {
+          const ok = await deliverOne(activeTg, item);
+          if (ok) deliveredCount++;
+        }
+        if (due.length < 25) break;
+      }
+
+      if (pendingReflush && pendingReflushTelegram) {
+        activeTg = pendingReflushTelegram;
+      }
+    } while (pendingReflush);
   } catch (err) {
     logger.warn({ err: (err as Error)?.message }, 'flushPendingAdminNotifications sweep error');
   } finally {
     isFlushing = false;
+    pendingReflush = false;
+    pendingReflushTelegram = null;
   }
   return deliveredCount;
 }

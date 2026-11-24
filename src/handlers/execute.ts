@@ -1,6 +1,7 @@
 // src/handlers/execute.ts — Layer 4: JAGER One-Confirm Full Cycle preview, live execution,
 // pre-summary BEP-20 payment wallet selection, and HTML one-click-copy admin payout notification.
 
+import crypto from 'crypto';
 import { Context } from 'telegraf';
 import type { InlineKeyboardMarkup } from 'telegraf/types';
 import { ethers } from 'ethers';
@@ -24,11 +25,11 @@ import {
   hasCompletedCycleForAgent,
   updateExecutionPayout,
   resetUserWalletBinding,
+  getPendingPayoutExecution,
   PayoutMode,
 } from '../db.js';
 import {
   enqueueAndDeliverAdminNotifications,
-  flushPendingAdminNotifications,
 } from '../notifications.js';
 import { KB } from '../keyboards.js';
 import { config } from '../config.js';
@@ -106,6 +107,7 @@ interface PendingPayoutState {
   userId: number;
   chatId: number;
   statusMessageId: number;
+  promptMessageId: number | null;
   userDisplayName: string;
   username: string | null;
   result: ExecutionSuccess;
@@ -120,6 +122,66 @@ export function isAwaitingPayoutWallet(userId: number): boolean {
 
 export function clearPendingPayout(userId: number): void {
   pendingPayouts.delete(userId);
+}
+
+/**
+ * Recovers a user's `PendingPayoutState` from PostgreSQL if the bot restarted while
+ * the user was on the pre-summary Bangla payout wallet prompt.
+ */
+async function recoverPendingPayoutState(ctx: Context, userId: number): Promise<PendingPayoutState | null> {
+  const inMem = pendingPayouts.get(userId);
+  if (inMem) return inMem;
+
+  const dbPending = await getPendingPayoutExecution(userId);
+  if (!dbPending) return null;
+
+  const e = dbPending.execution;
+  const tx = e.tx_hashes ?? {};
+  const walletAddr = e.wallet_address ?? e.agent_id_name ?? '';
+  if (!walletAddr) return null;
+
+  const mintCostUsdt = e.mint_cost_usdt ?? e.mint_cost_bnb ?? '0';
+  const sellUsdt = e.sell_usdt ?? e.sell_bnb ?? '0';
+  const netLoss = e.pnl_or_fee_usdt ?? e.pnl_or_fee ?? '0';
+
+  const recovered: PendingPayoutState = {
+    userId,
+    chatId: ctx.chat?.id ?? userId,
+    statusMessageId: ctx.callbackQuery?.message?.message_id ?? 0,
+    promptMessageId: ctx.callbackQuery?.message?.message_id ?? null,
+    userDisplayName: ctx.from?.first_name ?? ctx.from?.username ?? String(userId),
+    username: ctx.from?.username ?? null,
+    result: {
+      ok: true,
+      runId: crypto.randomUUID(),
+      executionId: e.id,
+      summary: e.summary ?? '',
+      agentId: e.agent_id_name ?? walletAddr,
+      walletAddress: walletAddr,
+      mintCostUsdt,
+      tokensReceived: e.tokens_received ?? '0',
+      sellUsdt,
+      netLossOrFeeUsdt: netLoss,
+      inviteRewardUsdt: e.invite_reward_usdt ?? undefined,
+      approveTxHash: tx.approve ?? 'N/A',
+      mintTxHash: tx.mint ?? 'N/A',
+      sellApproveTxHash: tx.sell_approve,
+      sellTxHash: tx.sell ?? 'N/A',
+      revokeTxHash: tx.revoke ?? 'N/A',
+      claimTxHash: tx.claim ?? 'N/A',
+      claimAttempts: e.claim_attempts ?? 0,
+      claimStatusNote: e.summary ?? undefined,
+      completedCount: dbPending.completedCount,
+    },
+    createdAt: new Date(e.created_at).getTime(),
+  };
+
+  pendingPayouts.set(userId, recovered);
+  logger.info(
+    { userId, executionId: e.id, agentId: recovered.result.agentId },
+    'Recovered awaiting_payout_wallet state from DB after restart',
+  );
+  return recovered;
 }
 
 function buildPayoutPromptBangla(agentWalletAddress: string): string {
@@ -159,10 +221,10 @@ export async function handleCompleteProcess(ctx: Context): Promise<void> {
     return;
   }
 
-  if (isAwaitingPayoutWallet(userId)) {
-    const state = pendingPayouts.get(userId)!;
+  const awaitingPayout = await recoverPendingPayoutState(ctx, userId);
+  if (awaitingPayout) {
     await safeAnswerCb(ctx, 'পেমেন্ট ওয়ালেট দিন বা স্কিপ করুন');
-    await ctx.reply(buildPayoutPromptBangla(state.result.walletAddress), KB.payoutWalletPrompt);
+    await ctx.reply(buildPayoutPromptBangla(awaitingPayout.result.walletAddress), KB.payoutWalletPrompt);
     return;
   }
 
@@ -367,26 +429,49 @@ export async function handleConfirmExecuteCycle(ctx: Context): Promise<void> {
   runFullExecution(userId, onStatus, reserved.preview)
     .then(async (result) => {
       if (result.ok) {
-        // Pause final summary delivery: prompt user in Bangla for BEP-20 payout wallet or Skip
-        pendingPayouts.set(userId, {
+        // 1. Mark user as awaiting payout wallet & send a FRESH Bangla prompt message
+        //    (fresh message triggers a real Telegram notification so user sees it immediately,
+        //    while also updating the progress message cleanly).
+        const payoutState: PendingPayoutState = {
           userId,
           chatId,
           statusMessageId: messageId,
+          promptMessageId: null,
           userDisplayName,
           username,
           result,
           createdAt: Date.now(),
-        });
-        await safeUpdateUser(userId, { current_step: 'awaiting_payout_wallet' });
-        await safeEditOrSend(
-          ctx,
-          chatId,
-          messageId,
-          buildPayoutPromptBangla(result.walletAddress),
-          KB.payoutWalletPrompt.reply_markup,
-        );
-        // Trigger a background flush of any prior deferred DB writes / pending admin alerts
-        void flushPendingAdminNotifications(ctx.telegram);
+        };
+        pendingPayouts.set(userId, payoutState);
+
+        const promptText = buildPayoutPromptBangla(result.walletAddress);
+
+        await Promise.all([
+          safeUpdateUser(userId, { current_step: 'awaiting_payout_wallet' }),
+          // Immediately notify ALL configured admins the moment all steps finish (guaranteed durable queue)
+          notifyAdminCompletionImmediate(ctx, payoutState),
+          // Update the in-flight status message cleanly (removes Cancel button)
+          ctx.telegram
+            .editMessageText(
+              chatId,
+              messageId,
+              undefined,
+              '✅ JAGER ফুল সাইকেলের সব ধাপ সফলভাবে সম্পন্ন হয়েছে! অনুগ্রহ করে নিচের মেসেজে আপনার পেমেন্ট ওয়ালেট দিন অথবা স্কিপ করুন।',
+            )
+            .catch(() => {}),
+          // Send a brand-new Bangla payout wallet prompt message so the user gets an active alert
+          ctx.telegram
+            .sendMessage(chatId, promptText, {
+              reply_markup: KB.payoutWalletPrompt.reply_markup,
+            })
+            .then((sent) => {
+              payoutState.promptMessageId = sent.message_id;
+            })
+            .catch(async (sendErr) => {
+              logger.warn({ err: sendErr, userId, chatId }, 'Fresh payout prompt sendMessage failed — falling back to status edit');
+              await safeEditOrSend(ctx, chatId, messageId, promptText, KB.payoutWalletPrompt.reply_markup);
+            }),
+        ]);
       } else if (result.alreadyCompleted) {
         await safeUpdateUser(userId, { current_step: 'completed' });
         await safeEditOrSend(ctx, chatId, messageId, ALREADY_COMPLETED_MESSAGE, KB.start.reply_markup);
@@ -433,7 +518,7 @@ export async function handleSkipPayoutWallet(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
   if (!userId) return;
 
-  const state = pendingPayouts.get(userId);
+  const state = await recoverPendingPayoutState(ctx, userId);
   if (!state) {
     await safeAnswerCb(ctx, 'ইতিমধ্যে সম্পন্ন হয়েছে');
     return;
@@ -453,7 +538,7 @@ export async function handlePayoutWalletInput(ctx: Context, rawText: string): Pr
   const userId = ctx.from?.id;
   if (!userId) return false;
 
-  const state = pendingPayouts.get(userId);
+  const state = await recoverPendingPayoutState(ctx, userId);
   if (!state) return false;
 
   const trimmed = rawText.trim();
@@ -535,17 +620,138 @@ async function finalizePayoutAndReport(
   );
 
   // Deliver user final summary and admin HTML payout notification in parallel
-  const deliverToUser = ctx.callbackQuery
-    ? safeEditOrSend(ctx, state.chatId, state.statusMessageId, finalSummary, KB.postExecution.reply_markup)
+  const promptMsgToClear = state.promptMessageId ?? state.statusMessageId;
+  const deliverToUser = ctx.callbackQuery && promptMsgToClear > 0
+    ? safeEditOrSend(ctx, state.chatId, promptMsgToClear, finalSummary, KB.postExecution.reply_markup)
     : ctx.reply(truncateForTelegram(finalSummary), KB.postExecution).then(() => {
         // Cleanly clear Skip button on the older prompt message (best-effort)
-        return ctx.telegram.editMessageReplyMarkup(state.chatId, state.statusMessageId, undefined, undefined).catch(() => {});
+        if (promptMsgToClear > 0) {
+          return ctx.telegram.editMessageReplyMarkup(state.chatId, promptMsgToClear, undefined, undefined).catch(() => {});
+        }
       });
 
   await Promise.all([
     deliverToUser,
     notifyAdminPayout(ctx, state, payoutWalletAddress, payoutMode, skippedToAgentWallet),
   ]);
+}
+
+/**
+ * Formats an HTML-safe immediate admin completion notification sent the instant
+ * all required cycle steps finish (`COMPLETED`), BEFORE waiting for the user to
+ * paste a payout wallet or tap Skip.
+ */
+export function buildAdminCompletionImmediateHtmlMessage(opts: {
+  userId: number;
+  userDisplayName: string;
+  username: string | null;
+  result: ExecutionSuccess;
+}): string {
+  const { userId, userDisplayName, username, result } = opts;
+  const userTag = username ? `${escapeHtml(userDisplayName)} (@${escapeHtml(username)})` : escapeHtml(userDisplayName);
+
+  const lines = [
+    `<b>🎉 JAGER Full Cycle Completed (Immediate Alert)</b>`,
+    ``,
+    `<b>👤 User:</b> ${userTag} (ID: <code>${userId}</code>)`,
+    `<b>🤖 Agent ID:</b> <code>${escapeHtml(result.agentId)}</code>`,
+    `<b>💳 Connected Agent Wallet (tap to copy):</b>`,
+    `<code>${escapeHtml(result.walletAddress)}</code>`,
+    `<b>⏳ Payout Wallet Status:</b> Awaiting user BEP-20 address or Skip (follow-up alert will arrive automatically)`,
+    ``,
+    `<b>📊 Cycle Summary:</b>`,
+    `• Mint Cost: ${escapeHtml(result.mintCostUsdt)} USDT`,
+    `• Sell Received: ${escapeHtml(result.sellUsdt)} USDT`,
+    `• Net Loss / Fees: ${escapeHtml(result.netLossOrFeeUsdt)} USDT`,
+    ...(result.inviteRewardUsdt ? [`• Invite Reward: +${escapeHtml(result.inviteRewardUsdt)} USDT`] : []),
+    `• Claim Attempts: ${result.claimAttempts}/${CLAIM_MAX_ATTEMPTS}` +
+      (result.claimStatusNote ? ` (${escapeHtml(result.claimStatusNote)})` : ''),
+    ``,
+    `<b>🔗 TX Hashes:</b>`,
+    `• approve: <code>${escapeHtml(result.approveTxHash)}</code>`,
+    `• mint: <code>${escapeHtml(result.mintTxHash)}</code>`,
+    ...(result.sellApproveTxHash ? [`• sell_approve: <code>${escapeHtml(result.sellApproveTxHash)}</code>`] : []),
+    `• sell: <code>${escapeHtml(result.sellTxHash)}</code>`,
+    `• revoke: <code>${escapeHtml(result.revokeTxHash)}</code>`,
+    `• claim: <code>${escapeHtml(result.claimTxHash)}</code>`,
+    ``,
+    `<b>Total completed by user:</b> ${result.completedCount}`,
+  ];
+
+  return truncateForTelegram(lines.join('\n'));
+}
+
+async function notifyAdminCompletionImmediate(
+  ctx: Context,
+  state: PendingPayoutState,
+): Promise<void> {
+  const r = state.result;
+  const htmlText = buildAdminCompletionImmediateHtmlMessage({
+    userId: state.userId,
+    userDisplayName: state.userDisplayName,
+    username: state.username,
+    result: r,
+  });
+
+  const plainFallback =
+    `🎉 JAGER Full Cycle Completed (Immediate Alert)\n\n` +
+    `User: ${state.userDisplayName}${state.username ? ` (@${state.username})` : ''} (ID: ${state.userId})\n` +
+    `Agent ID: ${r.agentId}\n` +
+    `Agent Wallet: ${r.walletAddress}\n` +
+    `Payout Wallet Status: Awaiting user BEP-20 address or Skip\n` +
+    `Mint: ${r.mintCostUsdt} USDT | Sell: ${r.sellUsdt} USDT | Net: ${r.netLossOrFeeUsdt} USDT\n` +
+    `Claim Attempts: ${r.claimAttempts}/${CLAIM_MAX_ATTEMPTS}\n` +
+    `TXs: approve=${r.approveTxHash} | mint=${r.mintTxHash} | sell=${r.sellTxHash} | revoke=${r.revokeTxHash} | claim=${r.claimTxHash}`;
+
+  const anchor = r.executionId != null
+    ? `exec_${r.executionId}`
+    : `run_${r.runId}`;
+
+  const structuredPayload: Record<string, unknown> = {
+    event: 'CYCLE_COMPLETED_IMMEDIATE',
+    telegramUserId: state.userId,
+    userDisplayName: state.userDisplayName,
+    username: state.username,
+    agentId: r.agentId,
+    agentWalletAddress: r.walletAddress,
+    payoutStatus: 'AWAITING_USER_SELECTION',
+    mintCostUsdt: r.mintCostUsdt,
+    sellUsdt: r.sellUsdt,
+    netLossOrFeeUsdt: r.netLossOrFeeUsdt,
+    inviteRewardUsdt: r.inviteRewardUsdt ?? null,
+    claimAttempts: r.claimAttempts,
+    claimMaxAttempts: CLAIM_MAX_ATTEMPTS,
+    claimStatusNote: r.claimStatusNote ?? null,
+    txHashes: {
+      approve: r.approveTxHash,
+      mint: r.mintTxHash,
+      ...(r.sellApproveTxHash ? { sell_approve: r.sellApproveTxHash } : {}),
+      sell: r.sellTxHash,
+      revoke: r.revokeTxHash,
+      claim: r.claimTxHash,
+    },
+    completedCount: r.completedCount,
+  };
+
+  try {
+    await enqueueAndDeliverAdminNotifications(
+      ctx.telegram,
+      config.ADMIN_IDS.map((adminId) => ({
+        dedupeKey: `jager_complete:${anchor}:${adminId}`,
+        adminId,
+        telegramUserId: state.userId,
+        executionId: r.executionId,
+        htmlMessage: htmlText,
+        plainMessage: plainFallback,
+        payload: structuredPayload,
+      })),
+    );
+  } catch (err) {
+    logger.error(
+      { err: (err as Error)?.message, userId: state.userId, executionId: r.executionId, anchor },
+      'notifyAdminCompletionImmediate unexpected error (background worker will continue retrying)',
+    );
+  }
 }
 
 /**
@@ -664,16 +870,23 @@ async function notifyAdminPayout(
   };
 
   // Persist in durable pending queue FIRST, then flush immediately (auto-retrying on failure)
-  await enqueueAndDeliverAdminNotifications(
-    ctx.telegram,
-    config.ADMIN_IDS.map((adminId) => ({
-      dedupeKey: `jager_payout:${anchor}:${adminId}`,
-      adminId,
-      telegramUserId: state.userId,
-      executionId: r.executionId,
-      htmlMessage: htmlText,
-      plainMessage: plainFallback,
-      payload: structuredPayload,
-    })),
-  );
+  try {
+    await enqueueAndDeliverAdminNotifications(
+      ctx.telegram,
+      config.ADMIN_IDS.map((adminId) => ({
+        dedupeKey: `jager_payout:${anchor}:${adminId}`,
+        adminId,
+        telegramUserId: state.userId,
+        executionId: r.executionId,
+        htmlMessage: htmlText,
+        plainMessage: plainFallback,
+        payload: structuredPayload,
+      })),
+    );
+  } catch (err) {
+    logger.error(
+      { err: (err as Error)?.message, userId: state.userId, executionId: r.executionId, anchor },
+      'notifyAdminPayout unexpected error (background worker will continue retrying)',
+    );
+  }
 }
