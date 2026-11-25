@@ -3,6 +3,7 @@
 // Strictly restricted to configured ADMIN_ID(s) — never exposed to normal users.
 
 import { Context } from 'telegraf';
+import { ethers } from 'ethers';
 import {
   getAdminOverviewStats,
   getAllStartedUsers,
@@ -10,13 +11,29 @@ import {
   getIncompleteUsers,
   isBotPaused,
   setBotPaused,
+  isEmergencyShutdown,
+  getEmergencyShutdownReason,
+  setEmergencyShutdown,
+  getWithdrawAmountUsdt,
+  setWithdrawAmountUsdt,
+  getAdminWalletConfig,
 } from '../db.js';
+import {
+  bawAvailable,
+  generateAdminWalletPairingUri,
+  verifyAndBindAdminWalletSession,
+  getAdminWalletStatus,
+  disconnectAdminWallet,
+} from '../wallet.js';
+import { ADDR, TOKEN_DECIMALS } from '../bsc.js';
+import { generateQrBuffer } from '../qr.js';
 import { cancelAllNonAdminExecutions } from '../executor.js';
 import { isAdminId } from '../config.js';
 import { KB } from '../keyboards.js';
 import { logger } from '../logger.js';
 
 const TELEGRAM_MAX_LEN = 3900;
+const awaitingWithdrawAmountAdmins = new Set<number>();
 
 async function safeAnswerCb(ctx: Context, text?: string): Promise<void> {
   try {
@@ -91,7 +108,10 @@ export async function handleAdminOverview(ctx: Context): Promise<void> {
   await safeAnswerCb(ctx, 'Loading admin overview…');
 
   try {
-    const stats = await getAdminOverviewStats();
+    const [stats, adminWallet] = await Promise.all([
+      getAdminOverviewStats(),
+      getAdminWalletStatus().catch(() => null),
+    ]);
     const incompleteRunsTotal =
       stats.stoppedRunsTotal + stats.failedRunsTotal + stats.cancelledRunsTotal;
 
@@ -107,13 +127,37 @@ export async function handleAdminOverview(ctx: Context): Promise<void> {
           ]
         : ['🤖 Completed Agent IDs: none yet'];
 
-    const botStatusLine = isBotPaused()
-      ? '🔴 STOPPED (Admin-Only Mode — normal users blocked)'
-      : '🟢 RUNNING (Active for all users)';
+    const emergencyActive = isEmergencyShutdown();
+    const emergencyReason = getEmergencyShutdownReason();
+    const botStatusLine = emergencyActive
+      ? `🚨 EMERGENCY AUTO-SHUTDOWN (Users see maintenance notice)\n   Reason: ${emergencyReason ?? 'Auto-payment wallet issue'}`
+      : isBotPaused()
+        ? '🔴 STOPPED (Admin-Only Mode — normal users blocked)'
+        : '🟢 RUNNING (Active for all users)';
+
+    const cachedAdminWallet = getAdminWalletConfig();
+    const adminWalletLines = adminWallet?.connected && adminWallet.address
+      ? [
+          `💼 Admin Agent Wallet (Auto-Pay Treasury):`,
+          `  • Status: 🟢 Connected`,
+          `  • Address: ${adminWallet.address}`,
+          `  • BEP-20 USDT Balance: ${Number(ethers.formatUnits(adminWallet.usdtBalanceWei, TOKEN_DECIMALS)).toFixed(4)} USDT`,
+          `  • BNB Gas Balance: ${Number(ethers.formatEther(adminWallet.bnbBalanceWei)).toFixed(6)} BNB`,
+          `  • Dev Mode: ${adminWallet.devModeEnabled === true && !adminWallet.devModeExpired ? 'ON ✅' : adminWallet.devModeEnabled === false || adminWallet.devModeExpired ? 'OFF / Expired ⚠️' : 'Unknown'}`,
+        ]
+      : [
+          `💼 Admin Agent Wallet (Auto-Pay Treasury):`,
+          `  • Status: 🔴 ${adminWallet?.sessionExpired ? 'SESSION EXPIRED — reconnect now!' : 'NOT CONNECTED'}`,
+          ...(cachedAdminWallet.address ? [`  • Last Address: ${cachedAdminWallet.address}`] : []),
+          ...(adminWallet?.error ? [`  • Detail: ${adminWallet.error}`] : []),
+        ];
 
     const lines = [
       `🛡️ Admin Dashboard Overview`,
       `Status: ${botStatusLine}`,
+      `💵 Withdraw Reward Amount: ${getWithdrawAmountUsdt()} USDT (BEP-20) per claim`,
+      ``,
+      ...adminWalletLines,
       ``,
       `👥 Users:`,
       `  • Total started: ${stats.totalUsers}`,
@@ -135,7 +179,7 @@ export async function handleAdminOverview(ctx: Context): Promise<void> {
       ``,
       ...agentSection,
       ``,
-      `Commands: /admin | /admin_completed | /admin_incomplete | /admin_users | /admin_stop | /admin_start`,
+      `Commands: /admin | /admin_wallet | /admin_withdraw <USDT> | /admin_resume | /admin_completed | /admin_incomplete | /admin_users | /admin_stop`,
     ];
 
     await replyChunked(ctx, lines.join('\n'), true);
@@ -190,6 +234,11 @@ export async function handleAdminCompleted(ctx: Context): Promise<void> {
         ? `\n    💸 Payout (${e.payout_mode ?? 'BEP-20'}): ${e.payout_wallet_address}`
         : `\n    💸 Payout: Pending user selection`;
 
+      const claimStatusLine = e.claim_payout_status
+        ? `\n    🎁 Auto-Pay Reward: ${e.claim_payout_amount_usdt ?? '?'} USDT — ${e.claim_payout_status}` +
+          (e.claim_payout_tx_hash ? ` (TX: ${e.claim_payout_tx_hash})` : '')
+        : '';
+
       const unit = e.currency === 'BNB' ? 'BNB' : 'USDT';
       const mintAmt = e.mint_cost_usdt ?? e.mint_cost_bnb;
       const sellAmt = e.sell_usdt ?? e.sell_bnb;
@@ -212,6 +261,7 @@ export async function handleAdminCompleted(ctx: Context): Promise<void> {
         `    🤖 Agent ID: ${agentDisplay}\n` +
         `    💳 Agent Wallet: ${walletDisplay}` +
         payoutLine +
+        claimStatusLine +
         `\n    ${amountsPart}${rewardPart}${claimPart}` +
         alertLine
       );
@@ -351,17 +401,227 @@ export async function handleAdminBotStop(ctx: Context): Promise<void> {
   );
 }
 
-/** /admin_start (and /start_bot) — re-enables the bot for all users */
+/** /admin_start, /start_bot, /admin_resume — clears Emergency Auto-Shutdown & pause, re-enabling the bot for all users */
 export async function handleAdminBotStart(ctx: Context): Promise<void> {
-  if (!(await guardAdmin(ctx))) return;
-  await safeAnswerCb(ctx, 'Starting bot for users…');
+  return handleAdminResume(ctx);
+}
 
-  const { persisted } = await setBotPaused(false);
+export async function handleAdminResume(ctx: Context): Promise<void> {
+  if (!(await guardAdmin(ctx))) return;
+  await safeAnswerCb(ctx, 'Resuming bot operations…');
+
+  const wasEmergency = isEmergencyShutdown();
+  const prevReason = getEmergencyShutdownReason();
+  const [emergRes, pauseRes, walletHealth] = await Promise.all([
+    setEmergencyShutdown(false),
+    setBotPaused(false),
+    getAdminWalletStatus().catch(() => null),
+  ]);
+
+  const persisted = emergRes.persisted && pauseRes.persisted;
+  const walletNote = walletHealth?.connected && walletHealth.address
+    ? `• Admin Agent Wallet: 🟢 Connected (${walletHealth.address})\n` +
+      `• Treasury Balance: ${Number(ethers.formatUnits(walletHealth.usdtBalanceWei, TOKEN_DECIMALS)).toFixed(4)} USDT | ${Number(ethers.formatEther(walletHealth.bnbBalanceWei)).toFixed(6)} BNB`
+    : `• ⚠️ Warning: Admin Agent Wallet is currently NOT connected (${walletHealth?.error ?? 'run /admin_wallet to pair'}). Auto-payouts will trigger Emergency Shutdown if a claim occurs before connecting & funding it!`;
 
   await ctx.reply(
-    `🟢 Bot STARTED and active for everyone.\n\n` +
-    `• Normal users: all commands, buttons, and processes are enabled again.\n` +
+    `🟢 Bot RESUMED and active for everyone.\n\n` +
+    (wasEmergency ? `• Cleared Emergency Auto-Shutdown (previous reason: ${prevReason ?? 'n/a'}).\n` : '') +
+    `• Normal users: all commands, executions, and reward claims are enabled.\n` +
+    `• Withdraw Reward Amount: ${getWithdrawAmountUsdt()} USDT (BEP-20) per claim\n` +
+    `${walletNote}\n` +
     `• Persistence: ${persisted ? 'Saved to database (survives restarts)' : 'Active in memory (DB degraded)'}`,
     KB.adminMenu,
   );
+}
+
+/** /admin_wallet or "💼 Connect Admin Wallet" — pairs the dedicated Admin Agent Wallet (treasury) via baw */
+export async function handleAdminConnectWallet(ctx: Context): Promise<void> {
+  if (!(await guardAdmin(ctx))) return;
+  await safeAnswerCb(ctx, 'Checking Admin Agent Wallet…');
+
+  if (!bawAvailable()) {
+    await ctx.reply(
+      '❌ @binance/agentic-wallet CLI binary is not installed on this server. Run "npm ci" and restart.',
+      KB.adminMenu,
+    );
+    return;
+  }
+
+  try {
+    let session = await generateAdminWalletPairingUri();
+    if (!session) {
+      await ctx.reply('❌ Could not start Admin Agent Wallet pairing via baw CLI. Check server logs.', KB.adminMenu);
+      return;
+    }
+
+    if (session.walletAddress) {
+      const health = await getAdminWalletStatus();
+      if (!health.connected || health.sessionExpired) {
+        // Stale baw session — sign out cleanly and generate a fresh pairing QR immediately
+        await disconnectAdminWallet();
+        session = await generateAdminWalletPairingUri();
+        if (!session) {
+          await ctx.reply('❌ Previous Admin Agent Wallet session expired and could not generate a new QR. Try again.', KB.adminMenu);
+          return;
+        }
+      } else {
+        const usdtText = health.balanceReadOk
+          ? `${Number(ethers.formatUnits(health.usdtBalanceWei, health.usdtDecimals)).toFixed(4)} USDT`
+          : 'RPC read failed (retry /admin)';
+        const bnbText = health.balanceReadOk
+          ? `${Number(ethers.formatEther(health.bnbBalanceWei)).toFixed(6)} BNB`
+          : 'RPC read failed (retry /admin)';
+        const devText =
+          health.devModeEnabled === true && !health.devModeExpired && !health.devModeBalanceExceeded && !health.quotaExhausted
+            ? 'ON ✅'
+            : '⚠️ Check Developer Mode / Quota in Binance App';
+        await ctx.reply(
+          `✅ Admin Agent Wallet is ALREADY connected!\n\n` +
+          `• Address (BSC): ${session.walletAddress}\n` +
+          `• BEP-20 USDT (${ADDR.USDT.slice(0, 10)}…): ${usdtText}\n` +
+          `• BNB Gas: ${bnbText}\n` +
+          `• Dev Mode: ${devText}\n` +
+          `• Withdraw Amount: ${getWithdrawAmountUsdt()} USDT per claim\n\n` +
+          `To switch to a different Admin Agent Wallet, run /admin_wallet_disconnect first.`,
+          KB.adminMenu,
+        );
+        return;
+      }
+    }
+
+    const expiresMin = Math.max(1, Math.round((session.expireAt - Date.now()) / 60_000));
+    try {
+      const qrBuf = await generateQrBuffer(session.urlForWeb);
+      await ctx.replyWithPhoto(
+        { source: qrBuf, filename: 'admin_wallet_connect.png' },
+        {
+          caption:
+            `💼 Connect Admin Agent Wallet (Auto-Payment Treasury)\n\n` +
+            `Scan with the Admin Binance App (keep BEP-20 USDT + BNB for gas & Developer Mode ON).\n` +
+            (session.pairingCode ? `Pairing code: ${session.pairingCode}\n` : '') +
+            `Expires in: ${expiresMin} min\n\n` +
+            `Or open: ${session.urlForWeb}\n\n` +
+            `✅ Confirmation will arrive automatically once approved.`,
+        },
+      );
+    } catch {
+      await ctx.reply(`💼 Open in Admin Binance app to connect Treasury Wallet:\n${session.urlForWeb}`, KB.adminMenu);
+    }
+
+    verifyAndBindAdminWalletSession(
+      session.qrCodeId,
+      async (connected) => {
+        try {
+          const health = await getAdminWalletStatus();
+          await ctx.reply(
+            `✅ Admin Agent Wallet Connected!\n\n` +
+            `• Treasury Address (BSC): ${connected.walletAddress}\n` +
+            `• BEP-20 USDT Balance: ${Number(ethers.formatUnits(health.usdtBalanceWei, TOKEN_DECIMALS)).toFixed(4)} USDT\n` +
+            `• BNB Gas Balance: ${Number(ethers.formatEther(health.bnbBalanceWei)).toFixed(6)} BNB\n` +
+            `• Dev Mode: ${health.devModeEnabled === true && !health.devModeExpired ? 'ON ✅' : '⚠️ Ensure Developer Mode is ON in Binance App'}\n` +
+            `• Current Withdraw Amount: ${getWithdrawAmountUsdt()} USDT per claim\n\n` +
+            (isEmergencyShutdown() ? `⚠️ Emergency Auto-Shutdown is currently active. Tap "✅ Resume / Start Bot" or run /admin_resume to re-enable users.` : `Auto-payment system is ready.`),
+            KB.adminMenu,
+          );
+        } catch (err) {
+          logger.warn({ err }, 'Could not send admin wallet connected notice');
+        }
+      },
+      async (reason) => {
+        try {
+          await ctx.reply(`❌ Admin Agent Wallet pairing failed:\n${reason}`, KB.adminMenu);
+        } catch { /* ignore */ }
+      },
+    );
+  } catch (err) {
+    logger.error({ err }, 'handleAdminConnectWallet error');
+    await ctx.reply('❌ Failed to start Admin Agent Wallet pairing.', KB.adminMenu);
+  }
+}
+
+/** /admin_wallet_disconnect — signs out the Admin Agent Wallet so another treasury wallet can be paired */
+export async function handleAdminDisconnectWallet(ctx: Context): Promise<void> {
+  if (!(await guardAdmin(ctx))) return;
+  await safeAnswerCb(ctx, 'Disconnecting Admin Wallet…');
+  await disconnectAdminWallet();
+  await ctx.reply(
+    '🔌 Admin Agent Wallet disconnected.\n\nUse "💼 Connect Admin Wallet" or /admin_wallet to pair a new treasury wallet before resuming auto-payments.',
+    KB.adminMenu,
+  );
+}
+
+/**
+ * /admin_withdraw [amount] or "💵 Adjust Withdraw Amount" button —
+ * lets admin configure how many BEP-20 USDT ($) a user receives per completed claim.
+ */
+export async function handleAdminAdjustWithdraw(ctx: Context): Promise<void> {
+  if (!(await guardAdmin(ctx))) return;
+  const adminId = ctx.from?.id;
+  if (!adminId) return;
+
+  // Check if called as `/admin_withdraw 1.5` with inline argument
+  const rawText = (ctx.message as { text?: string } | undefined)?.text?.trim() ?? '';
+  const argMatch = rawText.match(/^\/admin_withdraw(?:@\S+)?\s+(.+)$/i);
+  if (argMatch && argMatch[1]) {
+    awaitingWithdrawAmountAdmins.delete(adminId);
+    const res = await setWithdrawAmountUsdt(argMatch[1]);
+    if (!res.ok) {
+      await ctx.reply(`❌ ${res.error}`, KB.adminMenu);
+      return;
+    }
+    await ctx.reply(
+      `✅ অ্যাডজাস্ট উইথড্র অ্যামাউন্ট আপডেট হয়েছে! (Withdraw Amount Updated)\n\n` +
+      `• New Reward per Claim: ${res.amount} USDT (BEP-20)\n` +
+      `• Persistence: ${res.persisted ? 'Saved to database (survives restarts)' : 'Saved in memory (DB degraded)'}`,
+      KB.adminMenu,
+    );
+    return;
+  }
+
+  await safeAnswerCb(ctx, 'Enter new USDT reward amount');
+  awaitingWithdrawAmountAdmins.add(adminId);
+
+  await ctx.reply(
+    `💵 অ্যাডজাস্ট উইথড্র অ্যামাউন্ট (Adjust Withdraw Amount)\n\n` +
+    `• Current Reward per Claim: ${getWithdrawAmountUsdt()} USDT (BEP-20)\n\n` +
+    `নতুন USDT ($) পরিমাণ লিখে পাঠান (যেমন: 1, 1.5, 2.25) অথবা বাতিল করতে "cancel" লিখুন।\n` +
+    `(Reply with the new USDT reward amount per completed claim, or type "cancel" to abort.)`,
+  );
+}
+
+/**
+ * Intercepts admin text input while awaiting a new Withdraw Amount (BEP-20 USDT).
+ * Returns `true` if consumed.
+ */
+export async function handleAdminWithdrawAmountInput(ctx: Context, rawText: string): Promise<boolean> {
+  const adminId = ctx.from?.id;
+  if (!adminId || !isAdminId(adminId) || !awaitingWithdrawAmountAdmins.has(adminId)) {
+    return false;
+  }
+
+  const trimmed = rawText.trim();
+  if (/^(cancel|বাতিল)$/i.test(trimmed)) {
+    awaitingWithdrawAmountAdmins.delete(adminId);
+    await ctx.reply(
+      `❌ Withdraw amount update cancelled. Current amount remains ${getWithdrawAmountUsdt()} USDT.`,
+      KB.adminMenu,
+    );
+    return true;
+  }
+
+  const res = await setWithdrawAmountUsdt(trimmed);
+  if (!res.ok) {
+    await ctx.reply(`❌ ${res.error}\n\nTry again (e.g. 1.5) or type "cancel".`);
+    return true;
+  }
+
+  awaitingWithdrawAmountAdmins.delete(adminId);
+  await ctx.reply(
+    `✅ অ্যাডজাস্ট উইথড্র অ্যামাউন্ট আপডেট হয়েছে! (Withdraw Amount Updated)\n\n` +
+    `• New Reward per Claim: ${res.amount} USDT (BEP-20)\n` +
+    `• Persistence: ${res.persisted ? 'Saved to database (survives restarts)' : 'Saved in memory (DB degraded)'}`,
+    KB.adminMenu,
+  );
+  return true;
 }

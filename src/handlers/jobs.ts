@@ -5,6 +5,7 @@
 import { Context } from 'telegraf';
 import { getUserExecutions, getUser, DbExecution } from '../db.js';
 import { getSession } from '../wallet.js';
+import { isAdminId } from '../config.js';
 import { KB } from '../keyboards.js';
 import { logger } from '../logger.js';
 
@@ -38,6 +39,15 @@ function formatDate(d: Date | string | null | undefined): string {
 export async function handleMyJobs(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
   if (!userId) return;
+
+  if (isAdminId(userId)) {
+    await safeAnswerCb(ctx, 'Admin accounts use Admin Dashboard');
+    await ctx.reply(
+      '🛡️ Admin Role Isolation: Admin accounts cannot run regular user jobs. Use /admin or /admin_completed to view all completed cycles.',
+      KB.adminMenu,
+    );
+    return;
+  }
 
   await safeAnswerCb(ctx, 'Loading your status…');
 

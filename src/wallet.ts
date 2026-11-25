@@ -20,7 +20,18 @@ import * as fs      from 'fs';
 import { ethers }   from 'ethers';
 import { config }   from './config.js';
 import { logger }   from './logger.js';
-import { pool }     from './db.js';
+import { pool, setAdminWalletConfig, getAdminWalletConfig } from './db.js';
+import {
+  ADDR,
+  MIN_ADMIN_PAYOUT_BNB_GAS,
+  TOKEN_DECIMALS,
+  buildUsdtTransferCalldata,
+  pollTransactionReceipt,
+  readBnbBalance,
+  readUsdtBalance,
+  readUsdtDecimals,
+  simulateContractCall,
+} from './bsc.js';
 
 function normalizeEvmAddress(raw: string, label = 'wallet.address'): string {
   const trimmed = raw.trim();
@@ -80,11 +91,16 @@ export interface WalletSession {
   agentIdName?: string;
 }
 
+// Dedicated isolated baw session key for the Admin Agent Wallet (treasury for BEP-20 USDT auto-payouts).
+export const ADMIN_WALLET_SESSION_KEY = 'admin-treasury' as const;
+
 // In-memory cache; Supabase is durable source of truth.
 const sessions = new Map<number, WalletSession>();
+let adminWalletSession: WalletSession | null = null;
+let adminPairingNonce = 0;
 
-// Per-user execution mutex — prevents concurrent contract-calls on one session.
-const execLocks = new Map<number, Promise<void>>();
+// Per-session execution mutex — prevents concurrent contract-calls on one session.
+const execLocks = new Map<string, Promise<void>>();
 
 // Per-user pairing generation counter — invalidates stale background verifyAndBindSession calls
 // if the user restarts /connect or clicks Cancel before pairing completes.
@@ -98,12 +114,13 @@ function bumpPairingNonce(userId: number): number {
 // ─── Core baw CLI helper ─────────────────────────────────────────────────────
 
 /**
- * Runs `node <baw> <args...> --json` with per-user HOME isolation.
+ * Runs `node <baw> <args...> --json` with per-session HOME isolation.
+ * Accepts either a numeric Telegram `userId` or a named session key (e.g. `'admin-treasury'`).
  * Returns parsed JSON output. Throws with stderr on failure.
  */
 export async function callBaw(
   args: string[],
-  userId?: number,
+  sessionKey?: number | string,
   timeoutMs = 30_000,
 ): Promise<unknown> {
   if (!bawAvailable()) {
@@ -113,8 +130,8 @@ export async function callBaw(
   }
 
   return new Promise((resolve, reject) => {
-    const userHome = userId != null
-      ? path.join(config.BAW_SESSION_ROOT, String(userId))
+    const userHome = sessionKey != null
+      ? path.join(config.BAW_SESSION_ROOT, String(sessionKey))
       : config.BAW_SESSION_ROOT;
 
     try {
@@ -700,8 +717,28 @@ export async function executeContractCall(opts: {
   rpcEstimatedGas?: bigint; // live BSC RPC estimateGas result
   fallbackGasLimit?: number;// sensible ceiling if RPC estimation is unavailable
 }): Promise<ContractCallResult> {
+  return executeContractCallForSession({
+    ...opts,
+    sessionKey: opts.userId,
+  });
+}
+
+/**
+ * Executes a contract call through any isolated `baw` session (user ID or `'admin-treasury'`).
+ */
+export async function executeContractCallForSession(opts: {
+  sessionKey: number | string;
+  walletAddress: string;
+  to: string;
+  inputData: string;
+  value?: bigint;
+  gasLimit?: number;
+  step?: string;
+  rpcEstimatedGas?: bigint;
+  fallbackGasLimit?: number;
+}): Promise<ContractCallResult> {
   const {
-    userId,
+    sessionKey,
     inputData,
     value = 0n,
     gasLimit,
@@ -709,6 +746,8 @@ export async function executeContractCall(opts: {
     rpcEstimatedGas,
     fallbackGasLimit = 900_000,
   } = opts;
+  const userId = sessionKey;
+  const lockKey = String(sessionKey);
 
   const walletAddress = normalizeEvmAddress(opts.walletAddress, `${step}.from`);
   const to            = normalizeEvmAddress(opts.to, `${step}.to`);
@@ -732,12 +771,12 @@ export async function executeContractCall(opts: {
         : fallbackGasLimit,
   );
 
-  // Serialize per-user to prevent nonce races
-  const prev = execLocks.get(userId) ?? Promise.resolve();
+  // Serialize per-session to prevent nonce races
+  const prev = execLocks.get(lockKey) ?? Promise.resolve();
   let releaseLock!: () => void;
   const thisLock = new Promise<void>(r => { releaseLock = r; });
   const chainedLock = prev.then(() => thisLock);
-  execLocks.set(userId, chainedLock);
+  execLocks.set(lockKey, chainedLock);
 
   try {
     await prev; // wait for any previous call to finish
@@ -876,9 +915,555 @@ export async function executeContractCall(opts: {
     return { txHash, requestId, appliedGasLimit };
   } finally {
     releaseLock();
-    if (execLocks.get(userId) === chainedLock) {
-      execLocks.delete(userId);
+    if (execLocks.get(lockKey) === chainedLock) {
+      execLocks.delete(lockKey);
     }
+  }
+}
+
+// ─── Admin Agent Wallet (Treasury for BEP-20 USDT Auto-Payments) ─────────────
+
+async function refreshAdminWalletSessionFromBaw(): Promise<WalletSession | null> {
+  try {
+    const addrRaw = unwrap(
+      (await callBaw(['wallet', 'address'], ADMIN_WALLET_SESSION_KEY, 12_000)) as Record<string, unknown>,
+    );
+    const walletAddress = extractBscAddress(addrRaw);
+    if (!walletAddress) return null;
+
+    const session: WalletSession = {
+      qrCodeId: '',
+      urlForWeb: '',
+      expireAt: Date.now() + 86_400_000,
+      walletAddress,
+    };
+    adminWalletSession = session;
+    await setAdminWalletConfig(walletAddress, true);
+    return session;
+  } catch (err) {
+    const e = err as Error & { isSessionExpired?: boolean };
+    if (e.isSessionExpired) throw e;
+    return null;
+  }
+}
+
+export async function generateAdminWalletPairingUri(): Promise<WalletSession | null> {
+  try {
+    const raw = (await callBaw(['auth', 'signin'], ADMIN_WALLET_SESSION_KEY, 15_000)) as Record<string, unknown>;
+    const payload = unwrap(raw);
+
+    if (raw.status === 'ALREADY_CONNECTED' || payload.status === 'ALREADY_CONNECTED') {
+      logger.info('Admin Agent Wallet baw: already connected');
+      const refreshed = await refreshAdminWalletSessionFromBaw().catch(() => null);
+      if (refreshed?.walletAddress) return refreshed;
+      if (adminWalletSession?.walletAddress) return adminWalletSession;
+      return null;
+    }
+
+    const qrCodeId    = String(payload.qrCodeId    ?? payload.qrCode    ?? payload.id    ?? '');
+    const urlForWeb   = String(payload.urlForWeb   ?? payload.qrCodeUrl ?? payload.url   ?? payload.link ?? '');
+    const expireAt    = Number(payload.expireAt    ?? payload.expiry    ?? payload.expiresAt ?? Date.now() + 300_000);
+    const pairingCode = payload.pairingCode != null ? String(payload.pairingCode) : undefined;
+
+    if (!qrCodeId || !urlForWeb) {
+      logger.error({ payloadKeys: Object.keys(payload) }, 'Admin Agent Wallet baw auth signin: unexpected shape');
+      return null;
+    }
+
+    const session: WalletSession = { qrCodeId, urlForWeb, expireAt, pairingCode };
+    adminWalletSession = session;
+    return session;
+  } catch (err) {
+    logger.error({ err: (err as Error)?.message }, 'generateAdminWalletPairingUri failed');
+    return null;
+  }
+}
+
+export function verifyAndBindAdminWalletSession(
+  qrCodeId: string,
+  onConnected: (s: WalletSession) => void,
+  onFailed: (reason: string) => void,
+): void {
+  adminPairingNonce += 1;
+  const myNonce = adminPairingNonce;
+  (async () => {
+    try {
+      await callBaw(['auth', 'verify', '--qrCodeId', qrCodeId], ADMIN_WALLET_SESSION_KEY, 310_000);
+      if (adminPairingNonce !== myNonce) return;
+
+      const session = await refreshAdminWalletSessionFromBaw();
+      if (adminPairingNonce !== myNonce) return;
+      if (!session?.walletAddress) {
+        onFailed('Connected Admin Agent Wallet, but could not read its BSC address. Try again.');
+        return;
+      }
+      onConnected(session);
+    } catch (err) {
+      if (adminPairingNonce !== myNonce) return;
+      const msg = (err as Error)?.message ?? String(err);
+      onFailed(
+        msg.includes('expired') || msg.includes('QR_CODE_EXPIRED')
+          ? 'Admin wallet pairing link expired. Tap Connect Admin Wallet to generate a fresh QR.'
+          : `Admin wallet pairing failed: ${msg.slice(0, 200)}`,
+      );
+    }
+  })();
+}
+
+export async function disconnectAdminWallet(): Promise<void> {
+  adminPairingNonce += 1;
+  adminWalletSession = null;
+  try { await callBaw(['auth', 'signout'], ADMIN_WALLET_SESSION_KEY, 10_000); } catch { /* ok */ }
+  await setAdminWalletConfig(null, false);
+}
+
+export interface AdminWalletHealth {
+  connected: boolean;
+  sessionExpired: boolean;
+  address: string | null;
+  usdtBalanceWei: bigint;
+  bnbBalanceWei: bigint;
+  usdtDecimals: number;
+  balanceReadOk: boolean;
+  devModeEnabled: boolean | null;
+  devModeExpired: boolean;
+  devModeBalanceExceeded: boolean;
+  quotaExhausted: boolean;
+  error?: string;
+}
+
+async function readChainValueWithRetry<T>(label: string, fn: () => Promise<T>): Promise<{ ok: true; value: T } | { ok: false; error: string }> {
+  let lastErr = '';
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      return { ok: true, value: await fn() };
+    } catch (err) {
+      lastErr = (err as Error)?.message ?? String(err);
+      if (attempt < 2) await new Promise((r) => setTimeout(r, 400));
+    }
+  }
+  logger.warn({ label, err: lastErr }, 'Admin wallet on-chain balance read failed after retry');
+  return { ok: false, error: lastErr };
+}
+
+/**
+ * Checks LIVE Admin Agent Wallet connectivity, baw session validity, Developer Mode
+ * (enabled, expiry, balance cap, daily quota), and on-chain BSC BEP-20 USDT + BNB balances.
+ * Never masks RPC errors as `0n` balances.
+ */
+export async function getAdminWalletStatus(): Promise<AdminWalletHealth> {
+  const stored = getAdminWalletConfig();
+  const base: AdminWalletHealth = {
+    connected: false,
+    sessionExpired: false,
+    address: adminWalletSession?.walletAddress ?? stored.address,
+    usdtBalanceWei: 0n,
+    bnbBalanceWei: 0n,
+    usdtDecimals: TOKEN_DECIMALS,
+    balanceReadOk: false,
+    devModeEnabled: null,
+    devModeExpired: false,
+    devModeBalanceExceeded: false,
+    quotaExhausted: false,
+  };
+
+  if (!bawAvailable()) {
+    return { ...base, error: '@binance/agentic-wallet CLI binary is missing on this server.' };
+  }
+
+  let liveAddr: string | null = null;
+  try {
+    const addrRaw = unwrap(
+      (await callBaw(['wallet', 'address'], ADMIN_WALLET_SESSION_KEY, 12_000)) as Record<string, unknown>,
+    );
+    liveAddr = extractBscAddress(addrRaw);
+  } catch (err) {
+    const e = err as Error & { isSessionExpired?: boolean };
+    if (e.isSessionExpired) {
+      await setAdminWalletConfig(base.address, false);
+      return {
+        ...base,
+        connected: false,
+        sessionExpired: true,
+        error: 'Admin Agent Wallet session expired or disconnected (baw SESSION_EXPIRED).',
+      };
+    }
+    return {
+      ...base,
+      connected: false,
+      error: `Admin Agent Wallet unreachable: ${e.message.slice(0, 180)}`,
+    };
+  }
+
+  if (!liveAddr) {
+    await setAdminWalletConfig(null, false);
+    return {
+      ...base,
+      connected: false,
+      error: 'Admin Agent Wallet is not connected.',
+    };
+  }
+
+  adminWalletSession = {
+    qrCodeId: '',
+    urlForWeb: '',
+    expireAt: Date.now() + 86_400_000,
+    walletAddress: liveAddr,
+  };
+  await setAdminWalletConfig(liveAddr, true);
+
+  let devModeEnabled: boolean | null = null;
+  let devModeExpired = false;
+  let devModeBalanceExceeded = false;
+  let quotaExhausted = false;
+  try {
+    const settingsRaw = unwrap(
+      (await callBaw(['wallet', 'settings'], ADMIN_WALLET_SESSION_KEY, 12_000)) as Record<string, unknown>,
+    );
+    const devModeObj =
+      settingsRaw.devMode != null && typeof settingsRaw.devMode === 'object'
+        ? (settingsRaw.devMode as Record<string, unknown>)
+        : null;
+    if (devModeObj) {
+      devModeEnabled = parseBoolish(devModeObj.enabled ?? devModeObj.isEnabled ?? devModeObj.status);
+      devModeBalanceExceeded = parseBoolish(devModeObj.balanceExceeded) === true;
+      const rawExp = devModeObj.expiresAt;
+      if (rawExp != null) {
+        const s = String(rawExp);
+        const ts = /^\d+$/.test(s) ? (s.length <= 10 ? Number(s) * 1000 : Number(s)) : Date.parse(s);
+        if (Number.isFinite(ts) && ts > 0 && ts < Date.now()) devModeExpired = true;
+      }
+      const devDaily = toFiniteNumber(devModeObj.dailyLimit, 0);
+      const devUsed = settingsRaw.developerModeQuotaUsed == null ? null : toFiniteNumber(settingsRaw.developerModeQuotaUsed, 0);
+      if (devDaily > 0 && devUsed != null && devUsed >= devDaily) {
+        quotaExhausted = true;
+      }
+    } else if ('devMode' in settingsRaw && settingsRaw.devMode === null) {
+      devModeEnabled = false;
+    }
+    const dailyLimit = toFiniteNumber(settingsRaw.dailyLimit, 0);
+    const quotaUsed  = toFiniteNumber(settingsRaw.quotaUsed, 0);
+    const quotaLeft  = settingsRaw.quotaLeft != null
+      ? toFiniteNumber(settingsRaw.quotaLeft, Math.max(0, dailyLimit - quotaUsed))
+      : Math.max(0, dailyLimit - quotaUsed);
+    if (dailyLimit > 0 && quotaLeft <= 0) {
+      quotaExhausted = true;
+    }
+  } catch (err) {
+    const e = err as Error & { isSessionExpired?: boolean };
+    if (e.isSessionExpired) {
+      await setAdminWalletConfig(liveAddr, false);
+      return {
+        ...base,
+        address: liveAddr,
+        connected: false,
+        sessionExpired: true,
+        error: 'Admin Agent Wallet session expired during settings check.',
+      };
+    }
+  }
+
+  const [usdtRes, bnbRes, usdtDecimals] = await Promise.all([
+    readChainValueWithRetry('admin.usdtBalance', () => readUsdtBalance(liveAddr)),
+    readChainValueWithRetry('admin.bnbBalance', () => readBnbBalance(liveAddr)),
+    readUsdtDecimals(),
+  ]);
+
+  const balanceReadOk = usdtRes.ok && bnbRes.ok;
+
+  return {
+    connected: true,
+    sessionExpired: false,
+    address: liveAddr,
+    usdtBalanceWei: usdtRes.ok ? usdtRes.value : 0n,
+    bnbBalanceWei: bnbRes.ok ? bnbRes.value : 0n,
+    usdtDecimals,
+    balanceReadOk,
+    devModeEnabled,
+    devModeExpired,
+    devModeBalanceExceeded,
+    quotaExhausted,
+    ...(!balanceReadOk
+      ? { error: `BSC RPC balance read failed: ${!usdtRes.ok ? usdtRes.error : !bnbRes.ok ? bnbRes.error : 'unknown'}` }
+      : {}),
+  };
+}
+
+export type AdminUsdtTransferResult =
+  | {
+      ok: true;
+      txHash: string;
+      adminWalletAddress: string;
+    }
+  | {
+      ok: false;
+      triggerEmergencyShutdown: boolean;
+      /** TRUE only if a transaction was actually broadcast to BSC and confirmation timed out (MUST NOT release anti-abuse lock!). */
+      txBroadcasted: boolean;
+      txHash?: string;
+      failureCode:
+        | 'WALLET_DISCONNECTED'
+        | 'SESSION_EXPIRED'
+        | 'DEV_MODE_OFF'
+        | 'INSUFFICIENT_USDT'
+        | 'INSUFFICIENT_BNB'
+        | 'RPC_UNAVAILABLE'
+        | 'TRANSFER_TIMEOUT'
+        | 'TRANSFER_FAILED';
+      reason: string;
+      adminWalletAddress: string | null;
+      usdtBalanceWei?: bigint;
+      bnbBalanceWei?: bigint;
+    };
+
+/**
+ * Executes a real BEP-20 USDT (`0x55d398326f99059fF775485246999027B3197955`) transfer
+ * on BSC Mainnet (`chainId: 56`) from the connected Admin Agent Wallet via `baw contract-call`.
+ *
+ * Guarantees:
+ *   - Verifies exact on-chain BEP-20 USDT decimals (`readUsdtDecimals()`, 18) & parses exact amountWei.
+ *   - Verifies Admin Agent Wallet connectivity, session validity, Developer Mode, USDT balance, and BNB gas BEFORE broadcast.
+ *   - Simulates ERC-20 `transfer(recipient, amountWei)` via BSC RPC before calling `baw`.
+ *   - Polls BSC receipt until `status === 1` AND confirms ERC-20 `Transfer(adminWallet → recipient, amountWei)` log on-chain!
+ *   - Distinguishes pre-broadcast failures (`txBroadcasted: false`) from post-broadcast timeouts (`txBroadcasted: true`)
+ *     so an in-flight transfer can NEVER be double-paid.
+ */
+export async function executeAdminUsdtTransfer(
+  recipientAddress: string,
+  amountUsdtStr: string,
+): Promise<AdminUsdtTransferResult> {
+  const recipient = normalizeEvmAddress(recipientAddress, 'adminPayout.recipient');
+  if (recipient === ethers.ZeroAddress) {
+    return {
+      ok: false,
+      triggerEmergencyShutdown: false,
+      txBroadcasted: false,
+      failureCode: 'TRANSFER_FAILED',
+      reason: 'Recipient payout address cannot be zero address.',
+      adminWalletAddress: null,
+    };
+  }
+
+  const health = await getAdminWalletStatus();
+
+  if (!health.connected || !health.address) {
+    return {
+      ok: false,
+      triggerEmergencyShutdown: true,
+      txBroadcasted: false,
+      failureCode: health.sessionExpired ? 'SESSION_EXPIRED' : 'WALLET_DISCONNECTED',
+      reason: health.error ?? 'Admin Agent Wallet is disconnected or session expired.',
+      adminWalletAddress: health.address,
+      usdtBalanceWei: health.usdtBalanceWei,
+      bnbBalanceWei: health.bnbBalanceWei,
+    };
+  }
+
+  if (health.devModeEnabled === false || health.devModeExpired || health.devModeBalanceExceeded || health.quotaExhausted) {
+    const devReason = health.devModeExpired
+      ? 'Admin Agent Wallet Developer Mode has expired.'
+      : health.devModeBalanceExceeded
+        ? 'Admin Agent Wallet Developer Mode balance cap is exceeded.'
+        : health.quotaExhausted
+          ? 'Admin Agent Wallet daily quota is exhausted.'
+          : 'Admin Agent Wallet Developer Mode is turned OFF.';
+    return {
+      ok: false,
+      triggerEmergencyShutdown: true,
+      txBroadcasted: false,
+      failureCode: 'DEV_MODE_OFF',
+      reason: devReason,
+      adminWalletAddress: health.address,
+      usdtBalanceWei: health.usdtBalanceWei,
+      bnbBalanceWei: health.bnbBalanceWei,
+    };
+  }
+
+  if (!health.balanceReadOk) {
+    return {
+      ok: false,
+      triggerEmergencyShutdown: true,
+      txBroadcasted: false,
+      failureCode: 'RPC_UNAVAILABLE',
+      reason: health.error ?? 'Could not verify Admin Agent Wallet USDT/BNB balances on BSC RPC.',
+      adminWalletAddress: health.address,
+    };
+  }
+
+  let amountWei: bigint;
+  try {
+    amountWei = ethers.parseUnits(amountUsdtStr.trim(), health.usdtDecimals);
+    if (amountWei <= 0n) throw new Error('Amount must be > 0');
+  } catch (parseErr) {
+    return {
+      ok: false,
+      triggerEmergencyShutdown: true,
+      txBroadcasted: false,
+      failureCode: 'TRANSFER_FAILED',
+      reason: `Malformed USDT payout amount "${amountUsdtStr}": ${(parseErr as Error)?.message}`,
+      adminWalletAddress: health.address,
+      usdtBalanceWei: health.usdtBalanceWei,
+      bnbBalanceWei: health.bnbBalanceWei,
+    };
+  }
+
+  if (health.usdtBalanceWei < amountWei) {
+    const have = Number(ethers.formatUnits(health.usdtBalanceWei, health.usdtDecimals)).toFixed(4);
+    const need = Number(ethers.formatUnits(amountWei, health.usdtDecimals)).toFixed(4);
+    return {
+      ok: false,
+      triggerEmergencyShutdown: true,
+      txBroadcasted: false,
+      failureCode: 'INSUFFICIENT_USDT',
+      reason: `Admin Agent Wallet has insufficient BEP-20 USDT (need ${need} USDT, have ${have} USDT).`,
+      adminWalletAddress: health.address,
+      usdtBalanceWei: health.usdtBalanceWei,
+      bnbBalanceWei: health.bnbBalanceWei,
+    };
+  }
+
+  if (health.bnbBalanceWei < MIN_ADMIN_PAYOUT_BNB_GAS) {
+    return {
+      ok: false,
+      triggerEmergencyShutdown: true,
+      txBroadcasted: false,
+      failureCode: 'INSUFFICIENT_BNB',
+      reason: `Admin Agent Wallet has insufficient BNB for gas (need ≥ ${ethers.formatEther(MIN_ADMIN_PAYOUT_BNB_GAS)} BNB, have ${ethers.formatEther(health.bnbBalanceWei)} BNB).`,
+      adminWalletAddress: health.address,
+      usdtBalanceWei: health.usdtBalanceWei,
+      bnbBalanceWei: health.bnbBalanceWei,
+    };
+  }
+
+  const inputData = buildUsdtTransferCalldata(recipient, amountWei);
+  const sim = await simulateContractCall({
+    step: 'admin_usdt_payout',
+    from: health.address,
+    to: ADDR.USDT,
+    data: inputData,
+    value: 0n,
+  });
+
+  if (!sim.ok && sim.isRevert) {
+    return {
+      ok: false,
+      triggerEmergencyShutdown: true,
+      txBroadcasted: false,
+      failureCode: 'TRANSFER_FAILED',
+      reason: `BEP-20 USDT transfer simulation reverted: ${sim.revertReason ?? sim.error ?? 'reverted'}`,
+      adminWalletAddress: health.address,
+      usdtBalanceWei: health.usdtBalanceWei,
+      bnbBalanceWei: health.bnbBalanceWei,
+    };
+  }
+
+  try {
+    const execRes = await executeContractCallForSession({
+      sessionKey: ADMIN_WALLET_SESSION_KEY,
+      walletAddress: health.address,
+      to: ADDR.USDT,
+      inputData,
+      value: 0n,
+      rpcEstimatedGas: sim.ok ? sim.estimatedGas : undefined,
+      fallbackGasLimit: 100_000,
+      step: 'admin_usdt_payout',
+    });
+
+    const receipt = await pollTransactionReceipt(execRes.txHash, {
+      timeoutMs: 90_000,
+      pollIntervalMs: 1_500,
+      walletAddress: recipient,
+      expectedUsdtFrom: health.address,
+      expectedUsdtAmountWei: amountWei,
+    });
+
+    if (receipt.state === 'confirmed') {
+      if (!receipt.usdtTransferredExactMatch) {
+        logger.error(
+          {
+            adminWallet: health.address,
+            recipient,
+            expectedWei: amountWei.toString(),
+            receivedWei: receipt.usdtReceivedFromLogs.toString(),
+            txHash: execRes.txHash,
+          },
+          'Admin BEP-20 USDT payout TX confirmed on BSC but Transfer log did not match exact expected amount',
+        );
+        return {
+          ok: false,
+          triggerEmergencyShutdown: true,
+          txBroadcasted: true,
+          txHash: execRes.txHash,
+          failureCode: 'TRANSFER_FAILED',
+          reason: `Payout TX ${execRes.txHash} confirmed on BSC, but USDT Transfer log did not match exact expected amount (${amountUsdtStr} USDT).`,
+          adminWalletAddress: health.address,
+          usdtBalanceWei: health.usdtBalanceWei,
+          bnbBalanceWei: health.bnbBalanceWei,
+        };
+      }
+
+      logger.info(
+        {
+          adminWallet: health.address,
+          recipient,
+          amountUsdt: amountUsdtStr,
+          amountWei: amountWei.toString(),
+          usdtDecimals: health.usdtDecimals,
+          txHash: execRes.txHash,
+          blockNumber: receipt.receipt.blockNumber,
+        },
+        'Admin Agent Wallet BEP-20 USDT auto-payout confirmed & Transfer log verified on BSC',
+      );
+      return {
+        ok: true,
+        txHash: execRes.txHash,
+        adminWalletAddress: health.address,
+      };
+    }
+
+    if (receipt.state === 'reverted') {
+      return {
+        ok: false,
+        triggerEmergencyShutdown: true,
+        txBroadcasted: false, // Reverted on-chain: 0 USDT moved, safe to retry after admin fixes wallet
+        txHash: execRes.txHash,
+        failureCode: 'TRANSFER_FAILED',
+        reason: `Admin BEP-20 USDT transfer TX ${execRes.txHash} reverted on-chain (status=0).`,
+        adminWalletAddress: health.address,
+        usdtBalanceWei: health.usdtBalanceWei,
+        bnbBalanceWei: health.bnbBalanceWei,
+      };
+    }
+
+    // Timeout after broadcast: TX may still confirm on BSC — MUST NOT release anti-abuse lock!
+    return {
+      ok: false,
+      triggerEmergencyShutdown: false,
+      txBroadcasted: true,
+      txHash: execRes.txHash,
+      failureCode: 'TRANSFER_TIMEOUT',
+      reason: `Admin BEP-20 USDT transfer TX ${execRes.txHash} was broadcast to BSC but receipt confirmation timed out after 90s. Manual verification required to prevent double payout.`,
+      adminWalletAddress: health.address,
+      usdtBalanceWei: health.usdtBalanceWei,
+      bnbBalanceWei: health.bnbBalanceWei,
+    };
+  } catch (err) {
+    const e = err as Error & { isSessionExpired?: boolean };
+    const msg = e?.message ?? String(err);
+    const isExpired = Boolean(e?.isSessionExpired || /SESSION_EXPIRED|UNCONNECTED/i.test(msg));
+    if (isExpired) {
+      await setAdminWalletConfig(health.address, false);
+    }
+    return {
+      ok: false,
+      triggerEmergencyShutdown: true,
+      txBroadcasted: false,
+      failureCode: isExpired ? 'SESSION_EXPIRED' : 'TRANSFER_FAILED',
+      reason: `Admin BEP-20 USDT payout failed: ${msg.slice(0, 220)}`,
+      adminWalletAddress: health.address,
+      usdtBalanceWei: health.usdtBalanceWei,
+      bnbBalanceWei: health.bnbBalanceWei,
+    };
   }
 }
 

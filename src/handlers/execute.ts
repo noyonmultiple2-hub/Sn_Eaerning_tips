@@ -5,8 +5,19 @@ import crypto from 'crypto';
 import { Context } from 'telegraf';
 import type { InlineKeyboardMarkup } from 'telegraf/types';
 import { ethers } from 'ethers';
-import { isSessionConnectedDb, getSession, clearSession } from '../wallet.js';
-import { ADDR, normalizeAddress } from '../bsc.js';
+import {
+  isSessionConnectedDb,
+  getSession,
+  clearSession,
+  executeAdminUsdtTransfer,
+} from '../wallet.js';
+import {
+  ADDR,
+  REFERRER_NAME,
+  TOKEN_DECIMALS,
+  normalizeAddress,
+  verifyAgentReferrerOnChain,
+} from '../bsc.js';
 import {
   isUserLocked,
   isPreviewInProgress,
@@ -15,6 +26,7 @@ import {
   releaseReservedExecutionLock,
   clearPendingPreview,
   runFullExecution,
+  cancelAllNonAdminExecutions,
   ALREADY_COMPLETED_MESSAGE,
   CLAIM_MAX_ATTEMPTS,
   ExecutionSuccess,
@@ -26,14 +38,34 @@ import {
   updateExecutionPayout,
   resetUserWalletBinding,
   getPendingPayoutExecution,
+  getWithdrawAmountUsdt,
+  setEmergencyShutdown,
+  hasClaimedRewardForAgent,
+  reserveRewardClaim,
+  finalizeRewardClaim,
+  releaseRewardClaimOnSystemFailure,
   PayoutMode,
 } from '../db.js';
 import {
   enqueueAndDeliverAdminNotifications,
 } from '../notifications.js';
 import { KB } from '../keyboards.js';
-import { config } from '../config.js';
+import { config, isAdminId } from '../config.js';
 import { logger } from '../logger.js';
+
+const ADMIN_EXEC_BLOCKED_MSG =
+  '🛡️ Admin Role Isolation: Admin accounts cannot run regular user tasks, mint cycles, or reward claims.\n\n' +
+  'Use /admin to manage the Admin Dashboard, Admin Agent Wallet, and Withdraw Amount.';
+
+async function guardNonAdminUser(ctx: Context): Promise<boolean> {
+  const userId = ctx.from?.id;
+  if (isAdminId(userId)) {
+    await safeAnswerCb(ctx, 'Admin accounts use Admin Dashboard');
+    await ctx.reply(ADMIN_EXEC_BLOCKED_MSG, KB.adminMenu);
+    return false;
+  }
+  return true;
+}
 
 const TELEGRAM_SAFE_MAX_LEN = 3900;
 const BEP20_ADDRESS_REGEX   = /^0x[a-fA-F0-9]{40}$/;
@@ -101,20 +133,25 @@ async function safeEditOrSend(
   }
 }
 
-// ─── Pre-Summary BEP-20 Payout Wallet State ──────────────────────────────────
+// ─── Pre-Summary BEP-20 Payout Wallet & Claim Your Reward State ──────────────
 
 interface PendingPayoutState {
+  stage: 'awaiting_wallet' | 'awaiting_claim';
   userId: number;
   chatId: number;
   statusMessageId: number;
   promptMessageId: number | null;
+  claimMessageId: number | null;
   userDisplayName: string;
   username: string | null;
   result: ExecutionSuccess;
+  selectedPayoutWallet?: string;
+  selectedPayoutMode?: PayoutMode;
   createdAt: number;
 }
 
 const pendingPayouts = new Map<number, PendingPayoutState>();
+const claimInFlightUsers = new Set<number>();
 
 export function isAwaitingPayoutWallet(userId: number): boolean {
   return pendingPayouts.has(userId);
@@ -126,7 +163,7 @@ export function clearPendingPayout(userId: number): void {
 
 /**
  * Recovers a user's `PendingPayoutState` from PostgreSQL if the bot restarted while
- * the user was on the pre-summary Bangla payout wallet prompt.
+ * the user was on the pre-summary Bangla payout wallet prompt OR the "Claim Your Reward" button.
  */
 async function recoverPendingPayoutState(ctx: Context, userId: number): Promise<PendingPayoutState | null> {
   const inMem = pendingPayouts.get(userId);
@@ -143,14 +180,25 @@ async function recoverPendingPayoutState(ctx: Context, userId: number): Promise<
   const mintCostUsdt = e.mint_cost_usdt ?? e.mint_cost_bnb ?? '0';
   const sellUsdt = e.sell_usdt ?? e.sell_bnb ?? '0';
   const netLoss = e.pnl_or_fee_usdt ?? e.pnl_or_fee ?? '0';
+  const isClaimStage = dbPending.step === 'awaiting_claim' && Boolean(e.payout_wallet_address);
+  const payoutMode: PayoutMode | undefined =
+    e.payout_mode === 'AGENT_WALLET_SKIPPED'
+      ? 'AGENT_WALLET_SKIPPED'
+      : e.payout_wallet_address
+        ? 'CUSTOM_BEP20'
+        : undefined;
 
   const recovered: PendingPayoutState = {
+    stage: isClaimStage ? 'awaiting_claim' : 'awaiting_wallet',
     userId,
     chatId: ctx.chat?.id ?? userId,
     statusMessageId: ctx.callbackQuery?.message?.message_id ?? 0,
-    promptMessageId: ctx.callbackQuery?.message?.message_id ?? null,
+    promptMessageId: isClaimStage ? null : (ctx.callbackQuery?.message?.message_id ?? null),
+    claimMessageId: isClaimStage ? (ctx.callbackQuery?.message?.message_id ?? null) : null,
     userDisplayName: ctx.from?.first_name ?? ctx.from?.username ?? String(userId),
     username: ctx.from?.username ?? null,
+    selectedPayoutWallet: e.payout_wallet_address ?? undefined,
+    selectedPayoutMode: payoutMode,
     result: {
       ok: true,
       runId: crypto.randomUUID(),
@@ -178,10 +226,33 @@ async function recoverPendingPayoutState(ctx: Context, userId: number): Promise<
 
   pendingPayouts.set(userId, recovered);
   logger.info(
-    { userId, executionId: e.id, agentId: recovered.result.agentId },
-    'Recovered awaiting_payout_wallet state from DB after restart',
+    { userId, executionId: e.id, agentId: recovered.result.agentId, stage: recovered.stage },
+    'Recovered pending payout/claim state from DB after restart',
   );
   return recovered;
+}
+
+function buildClaimRewardPromptText(opts: {
+  payoutWalletAddress: string;
+  payoutMode: PayoutMode;
+  amountUsdt: string;
+}): string {
+  const modeText =
+    opts.payoutMode === 'AGENT_WALLET_SKIPPED'
+      ? 'Agent Wallet (স্কিপ করা হয়েছে)'
+      : 'Custom BEP-20 Wallet (সাবমিট করা ওয়ালেট)';
+  return [
+    `🎁 Claim Your Reward (BEP-20 USDT)`,
+    ``,
+    `✅ আপনার পেমেন্ট ওয়ালেট সেট করা হয়েছে:`,
+    `• Payout Wallet (BEP-20): ${opts.payoutWalletAddress}`,
+    `• Mode: ${modeText}`,
+    ``,
+    `💵 রিওয়ার্ড অ্যামাউন্ট (Reward Amount): ${opts.amountUsdt} USDT`,
+    `🪙 Token: BEP-20 USDT (${ADDR.USDT})`,
+    ``,
+    `অটো পেমেন্ট পেতে নিচের "🎁 Claim Your Reward" বাটনে ক্লিক করুন।`,
+  ].join('\n');
 }
 
 function buildPayoutPromptBangla(agentWalletAddress: string): string {
@@ -214,6 +285,7 @@ function buildInvalidBep20ReplyBangla(): string {
 export async function handleCompleteProcess(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
   if (!userId) return;
+  if (!(await guardNonAdminUser(ctx))) return;
 
   if (isUserLocked(userId)) {
     await safeAnswerCb(ctx, 'Job already running');
@@ -223,6 +295,19 @@ export async function handleCompleteProcess(ctx: Context): Promise<void> {
 
   const awaitingPayout = await recoverPendingPayoutState(ctx, userId);
   if (awaitingPayout) {
+    if (awaitingPayout.stage === 'awaiting_claim' && awaitingPayout.selectedPayoutWallet && awaitingPayout.selectedPayoutMode) {
+      const amt = getWithdrawAmountUsdt();
+      await safeAnswerCb(ctx, 'রিওয়ার্ড ক্লেইম করুন');
+      await ctx.reply(
+        buildClaimRewardPromptText({
+          payoutWalletAddress: awaitingPayout.selectedPayoutWallet,
+          payoutMode: awaitingPayout.selectedPayoutMode,
+          amountUsdt: amt,
+        }),
+        KB.claimReward(amt),
+      );
+      return;
+    }
     await safeAnswerCb(ctx, 'পেমেন্ট ওয়ালেট দিন বা স্কিপ করুন');
     await ctx.reply(buildPayoutPromptBangla(awaitingPayout.result.walletAddress), KB.payoutWalletPrompt);
     return;
@@ -337,6 +422,7 @@ export async function handleCompleteProcess(ctx: Context): Promise<void> {
 export async function handleCancelPreview(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
   if (!userId) return;
+  if (!(await guardNonAdminUser(ctx))) return;
   await safeAnswerCb(ctx, 'Preview cancelled');
   clearPendingPreview(userId);
   await safeUpdateUser(userId, { current_step: 'connected' });
@@ -360,6 +446,7 @@ export async function handleCancelPreview(ctx: Context): Promise<void> {
 export async function handleConfirmExecuteCycle(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
   if (!userId) return;
+  if (!(await guardNonAdminUser(ctx))) return;
 
   // Synchronous atomic reservation before any await (prevents double-tap race)
   const reserved = reserveExecutionFromPreview(userId);
@@ -433,10 +520,12 @@ export async function handleConfirmExecuteCycle(ctx: Context): Promise<void> {
         //    (fresh message triggers a real Telegram notification so user sees it immediately,
         //    while also updating the progress message cleanly).
         const payoutState: PendingPayoutState = {
+          stage: 'awaiting_wallet',
           userId,
           chatId,
           statusMessageId: messageId,
           promptMessageId: null,
+          claimMessageId: null,
           userDisplayName,
           username,
           result,
@@ -507,32 +596,46 @@ export async function handleConfirmExecuteCycle(ctx: Context): Promise<void> {
     });
 }
 
-// ─── Pre-Summary BEP-20 Payout Handlers ──────────────────────────────────────
+// ─── Pre-Summary BEP-20 Payout & Claim Your Reward Handlers ──────────────────
 
 /**
  * Triggered when user clicks `⏭️ স্কিপ (এজেন্ট ওয়ালেটে পেমেন্ট)`.
- * Assigns payout to the user's connected Agent Wallet (`AGENT_WALLET_SKIPPED`)
- * and immediately delivers the final summary + admin payout notification.
+ * Saves payout to the user's connected Agent Wallet (`AGENT_WALLET_SKIPPED`)
+ * and presents the "🎁 Claim Your Reward (USDT)" step BEFORE final summary.
  */
 export async function handleSkipPayoutWallet(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
   if (!userId) return;
+  if (!(await guardNonAdminUser(ctx))) return;
 
   const state = await recoverPendingPayoutState(ctx, userId);
   if (!state) {
     await safeAnswerCb(ctx, 'ইতিমধ্যে সম্পন্ন হয়েছে');
     return;
   }
-  pendingPayouts.delete(userId);
-  await safeAnswerCb(ctx, 'এজেন্ট ওয়ালেট সিলেক্ট করা হয়েছে');
 
-  await finalizePayoutAndReport(ctx, state, state.result.walletAddress, 'AGENT_WALLET_SKIPPED');
+  if (state.stage === 'awaiting_claim' && state.selectedPayoutWallet && state.selectedPayoutMode) {
+    const amt = getWithdrawAmountUsdt();
+    await safeAnswerCb(ctx, 'এখন Claim Your Reward বাটনে ক্লিক করুন');
+    await ctx.reply(
+      buildClaimRewardPromptText({
+        payoutWalletAddress: state.selectedPayoutWallet,
+        payoutMode: state.selectedPayoutMode,
+        amountUsdt: amt,
+      }),
+      KB.claimReward(amt),
+    );
+    return;
+  }
+
+  await safeAnswerCb(ctx, 'এজেন্ট ওয়ালেট সিলেক্ট করা হয়েছে');
+  await presentClaimRewardStep(ctx, state, state.result.walletAddress, 'AGENT_WALLET_SKIPPED');
 }
 
 /**
  * Called at the very top of `handleMessage` before Gemini intent routing.
  * Returns `true` if this user is currently awaiting a payout wallet address
- * (consuming the message cleanly so Gemini never interferes).
+ * OR awaiting the "Claim Your Reward" click (consuming the message cleanly).
  */
 export async function handlePayoutWalletInput(ctx: Context, rawText: string): Promise<boolean> {
   const userId = ctx.from?.id;
@@ -541,12 +644,25 @@ export async function handlePayoutWalletInput(ctx: Context, rawText: string): Pr
   const state = await recoverPendingPayoutState(ctx, userId);
   if (!state) return false;
 
+  // If wallet is already selected, remind user to tap the Claim Your Reward button
+  if (state.stage === 'awaiting_claim' && state.selectedPayoutWallet && state.selectedPayoutMode) {
+    const amt = getWithdrawAmountUsdt();
+    await ctx.reply(
+      buildClaimRewardPromptText({
+        payoutWalletAddress: state.selectedPayoutWallet,
+        payoutMode: state.selectedPayoutMode,
+        amountUsdt: amt,
+      }),
+      KB.claimReward(amt),
+    );
+    return true;
+  }
+
   const trimmed = rawText.trim();
 
   // Allow typing "skip" or "স্কিপ" as an alias for the Skip button
   if (/^(skip|স্কিপ)$/i.test(trimmed)) {
-    pendingPayouts.delete(userId);
-    await finalizePayoutAndReport(ctx, state, state.result.walletAddress, 'AGENT_WALLET_SKIPPED');
+    await presentClaimRewardStep(ctx, state, state.result.walletAddress, 'AGENT_WALLET_SKIPPED');
     return true;
   }
 
@@ -557,83 +673,445 @@ export async function handlePayoutWalletInput(ctx: Context, rawText: string): Pr
     return true;
   }
 
-  pendingPayouts.delete(userId);
-  await finalizePayoutAndReport(ctx, state, validatedAddress, 'CUSTOM_BEP20');
+  await presentClaimRewardStep(ctx, state, validatedAddress, 'CUSTOM_BEP20');
   return true;
 }
 
 /**
- * Persists the selected payout wallet & mode to PostgreSQL, delivers the user's
- * complete final summary report (including the chosen payout address), and sends
- * the HTML one-click-copy payout notification to all configured admins.
+ * Persists the chosen BEP-20 payout address & mode and displays the
+ * "🎁 Claim Your Reward ($X.XX USDT)" confirmation button before auto-payment & final summary.
  */
-async function finalizePayoutAndReport(
+async function presentClaimRewardStep(
   ctx: Context,
   state: PendingPayoutState,
   payoutWalletAddress: string,
   payoutMode: PayoutMode,
 ): Promise<void> {
-  const skippedToAgentWallet = payoutMode === 'AGENT_WALLET_SKIPPED';
   const r = state.result;
+  const amountUsdt = getWithdrawAmountUsdt();
 
-  const [, , finalSummary] = await Promise.all([
+  state.stage = 'awaiting_claim';
+  state.selectedPayoutWallet = payoutWalletAddress;
+  state.selectedPayoutMode = payoutMode;
+  pendingPayouts.set(state.userId, state);
+
+  await Promise.all([
     updateExecutionPayout(r.executionId, payoutWalletAddress, payoutMode, {
       telegramUserId: state.userId,
       walletAddress: r.walletAddress,
       sellTxHash: r.sellTxHash,
     }),
-    safeUpdateUser(state.userId, { current_step: 'completed' }),
-    generateExecutionSummary({
-      agentId: r.agentId,
-      walletAddress: r.walletAddress,
-      mintCostUsdt: r.mintCostUsdt,
-      tokensReceived: r.tokensReceived,
-      sellUsdt: r.sellUsdt,
-      netLossOrFeeUsdt: r.netLossOrFeeUsdt,
-      inviteRewardUsdt: r.inviteRewardUsdt,
-      approveTxHash: r.approveTxHash,
-      mintTxHash: r.mintTxHash,
-      sellApproveTxHash: r.sellApproveTxHash,
-      sellTxHash: r.sellTxHash,
-      revokeTxHash: r.revokeTxHash,
-      claimTxHash: r.claimTxHash,
-      claimAttempts: r.claimAttempts,
-      claimMaxAttempts: CLAIM_MAX_ATTEMPTS,
-      claimStatusNote: r.claimStatusNote,
-      payoutWalletAddress,
-      payoutMode,
-      skippedToAgentWallet,
-      status: 'COMPLETED',
-    }),
+    safeUpdateUser(state.userId, { current_step: 'awaiting_claim' }),
   ]);
 
-  logger.info(
-    {
-      userId: state.userId,
+  const claimPromptText = buildClaimRewardPromptText({
+    payoutWalletAddress,
+    payoutMode,
+    amountUsdt,
+  });
+
+  const promptMsgToClear = state.promptMessageId ?? state.statusMessageId;
+  if (ctx.callbackQuery && promptMsgToClear > 0) {
+    await safeEditOrSend(
+      ctx,
+      state.chatId,
+      promptMsgToClear,
+      claimPromptText,
+      KB.claimReward(amountUsdt).reply_markup,
+    );
+    state.claimMessageId = promptMsgToClear;
+  } else {
+    const sent = await ctx.reply(claimPromptText, KB.claimReward(amountUsdt));
+    state.claimMessageId = sent.message_id;
+    if (promptMsgToClear > 0) {
+      ctx.telegram.editMessageReplyMarkup(state.chatId, promptMsgToClear, undefined, undefined).catch(() => {});
+    }
+  }
+}
+
+/**
+ * Triggered when user clicks `🎁 Claim Your Reward ($X.XX USDT)`:
+ *   1. Enforces strict anti-abuse lock: same Agent ID or same Agent Wallet can NEVER
+ *      be claimed/paid more than once (while allowing unlimited distinct Agent IDs per BEP-20 wallet).
+ *   2. Runs strict on-chain + account-state referral verification confirming the Agent ID / Wallet
+ *      worked under our hardcoded referrer (`noyonislam.ai` / `0x85377229b28515432cCF1e1c4999BB71C9AdBE11`).
+ *      - On mismatch/failure → blocks auto-payout, tells user in Bangla manual payment requested,
+ *        sends fast final summary, and alerts admins titled **`রিভিউ টু পেমেন্ট`**.
+ *   3. Checks Admin Agent Wallet health & executes real BEP-20 USDT (`0x55d398...`) transfer on BSC:
+ *      - On Admin Agent Wallet disconnect / expired session / low USDT / low BNB / transfer failure →
+ *        tells user *"অটো পেমেন্ট সিস্টেম একটু ঝামেলা হয়েছে, ১০ মিনিট অপেক্ষা করুন।"*, activates
+ *        Emergency Auto-Shutdown (*"কিছু যান্ত্রিক ত্রুটির কারণে সমস্যা হচ্ছে, বটটা আপডেট হচ্ছে।"*),
+ *        and sends urgent strict alert to admins!
+ *      - On success → marks `reward_claims` PAID, delivers fast final summary to user, and sends
+ *        guaranteed HTML admin alert with copyable `<code>0x...</code>`, USDT claimed, and PAID status!
+ */
+export async function handleClaimReward(ctx: Context): Promise<void> {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+  if (!(await guardNonAdminUser(ctx))) return;
+
+  if (claimInFlightUsers.has(userId)) {
+    await safeAnswerCb(ctx, 'আপনার রিওয়ার্ড প্রসেস হচ্ছে…');
+    return;
+  }
+
+  const state = await recoverPendingPayoutState(ctx, userId);
+  if (!state || !state.selectedPayoutWallet || !state.selectedPayoutMode) {
+    await safeAnswerCb(ctx, 'ইতিমধ্যে ক্লেইম করা হয়েছে');
+    return;
+  }
+
+  claimInFlightUsers.add(userId);
+  await safeAnswerCb(ctx, 'রিওয়ার্ড যাচাই ও পেমেন্ট প্রসেস হচ্ছে…');
+
+  const r = state.result;
+  const payoutWalletAddress = state.selectedPayoutWallet;
+  const payoutMode = state.selectedPayoutMode;
+  const skippedToAgentWallet = payoutMode === 'AGENT_WALLET_SKIPPED';
+  const amountUsdt = getWithdrawAmountUsdt();
+  const claimMsgId = state.claimMessageId ?? ctx.callbackQuery?.message?.message_id ?? state.statusMessageId;
+
+  let claimId: number | null = null;
+  let lockReserved = false;
+  let claimFinalized = false;
+  let txBroadcasted = false;
+
+  try {
+    // 1. Strict Anti-Abuse Lock: check & atomically reserve (per Agent ID & per Agent Wallet ONLY)
+    const priorClaim = await hasClaimedRewardForAgent({
+      agentIdName: r.agentId,
+      agentWalletAddress: r.walletAddress,
+    });
+    if (priorClaim.claimed) {
+      pendingPayouts.delete(userId);
+      await safeUpdateUser(userId, { current_step: 'completed' });
+      const dupMsg =
+        `⛔ এই Agent ID (${r.agentId}) / Agent Wallet এর জন্য ইতিমধ্যেই রিওয়ার্ড ক্লেইম/পেমেন্ট সম্পন্ন হয়েছে।\n` +
+        `(একই Agent ID বা Agent Wallet দিয়ে একাধিকবার রিওয়ার্ড ক্লেইম করা যাবে না। নতুন .ai Agent ID কানেক্ট করে কাজ করলে আবার পেমেন্ট পাবেন।)`;
+      if (claimMsgId > 0) {
+        await safeEditOrSend(ctx, state.chatId, claimMsgId, dupMsg, KB.postExecution.reply_markup);
+      } else {
+        await ctx.reply(dupMsg, KB.postExecution);
+      }
+      return;
+    }
+
+    const reservation = await reserveRewardClaim({
       executionId: r.executionId,
-      agentId: r.agentId,
+      telegramUserId: userId,
+      agentIdName: r.agentId,
+      agentWalletAddress: r.walletAddress,
       payoutWalletAddress,
       payoutMode,
-      skippedToAgentWallet,
-    },
-    'Finalized JAGER payout wallet selection — delivering final summary & admin payout alert',
-  );
+      amountUsdt,
+    });
 
-  // Deliver user final summary and admin HTML payout notification in parallel
-  const promptMsgToClear = state.promptMessageId ?? state.statusMessageId;
-  const deliverToUser = ctx.callbackQuery && promptMsgToClear > 0
-    ? safeEditOrSend(ctx, state.chatId, promptMsgToClear, finalSummary, KB.postExecution.reply_markup)
-    : ctx.reply(truncateForTelegram(finalSummary), KB.postExecution).then(() => {
-        // Cleanly clear Skip button on the older prompt message (best-effort)
-        if (promptMsgToClear > 0) {
-          return ctx.telegram.editMessageReplyMarkup(state.chatId, promptMsgToClear, undefined, undefined).catch(() => {});
-        }
+    if (!reservation.reserved) {
+      pendingPayouts.delete(userId);
+      await safeUpdateUser(userId, { current_step: 'completed' });
+      const blockedMsg =
+        `⛔ এই Agent ID (${r.agentId}) / Agent Wallet এর রিওয়ার্ড ক্লেইম ইতিমধ্যেই লক/সম্পন্ন হয়েছে।`;
+      if (claimMsgId > 0) {
+        await safeEditOrSend(ctx, state.chatId, claimMsgId, blockedMsg, KB.postExecution.reply_markup);
+      } else {
+        await ctx.reply(blockedMsg, KB.postExecution);
+      }
+      return;
+    }
+
+    claimId = reservation.claimId;
+    lockReserved = true;
+
+    if (claimMsgId > 0) {
+      await safeEditOrSend(
+        ctx,
+        state.chatId,
+        claimMsgId,
+        `🔍 আপনার রেফারেল (${REFERRER_NAME}) যাচাই এবং ${amountUsdt} USDT (BEP-20) অটো পেমেন্ট প্রসেস হচ্ছে… অনুগ্রহ করে কয়েক সেকেন্ড অপেক্ষা করুন।`,
+      );
+    }
+
+    // 2. Strict On-Chain & Account-State Referral Verification (both custom BEP-20 & skipped Agent Wallet)
+    const refCheck = await verifyAgentReferrerOnChain({
+      agentWalletAddress: r.walletAddress,
+      agentIdName: r.agentId,
+      mintTxHash: r.mintTxHash,
+    });
+
+    if (!refCheck.verified) {
+      const failReason = refCheck.reason ?? `Agent ID / Wallet could not be verified under referrer ${REFERRER_NAME} (${ADDR.REFERRER}).`;
+      logger.warn(
+        {
+          userId,
+          executionId: r.executionId,
+          agentId: r.agentId,
+          agentWallet: r.walletAddress,
+          payoutWalletAddress,
+          payoutMode,
+          failReason,
+        },
+        'Strict referral verification FAILED — blocking auto-payout and routing to Manual Review (রিভিউ টু পেমেন্ট)',
+      );
+
+      pendingPayouts.delete(userId);
+      claimFinalized = true;
+      await Promise.all([
+        finalizeRewardClaim({
+          claimId,
+          executionId: r.executionId,
+          status: 'MANUAL_REVIEW',
+          referralVerified: false,
+          amountUsdt,
+          failureReason: failReason,
+          agentIdName: r.agentId,
+          agentWalletAddress: r.walletAddress,
+        }),
+        safeUpdateUser(userId, { current_step: 'completed' }),
+      ]);
+
+      const finalSummary = await generateExecutionSummary({
+        agentId: r.agentId,
+        walletAddress: r.walletAddress,
+        mintCostUsdt: r.mintCostUsdt,
+        tokensReceived: r.tokensReceived,
+        sellUsdt: r.sellUsdt,
+        netLossOrFeeUsdt: r.netLossOrFeeUsdt,
+        inviteRewardUsdt: r.inviteRewardUsdt,
+        approveTxHash: r.approveTxHash,
+        mintTxHash: r.mintTxHash,
+        sellApproveTxHash: r.sellApproveTxHash,
+        sellTxHash: r.sellTxHash,
+        revokeTxHash: r.revokeTxHash,
+        claimTxHash: r.claimTxHash,
+        claimAttempts: r.claimAttempts,
+        claimMaxAttempts: CLAIM_MAX_ATTEMPTS,
+        claimStatusNote: r.claimStatusNote,
+        payoutWalletAddress,
+        payoutMode,
+        skippedToAgentWallet,
+        rewardClaimAmountUsdt: amountUsdt,
+        rewardClaimStatus: 'MANUAL_REVIEW',
+        status: 'COMPLETED',
       });
 
-  await Promise.all([
-    deliverToUser,
-    notifyAdminPayout(ctx, state, payoutWalletAddress, payoutMode, skippedToAgentWallet),
-  ]);
+      const userNotice =
+        `⚠️ আপনার ক্লেইম / রেফারেল ভেরিফিকেশনে একটি সমস্যা দেখা দিয়েছে।\n` +
+        `আপনার পেমেন্টটি ম্যানুয়াল পেমেন্টের (Manual Payment) জন্য অ্যাডমিনের কাছে পাঠানো হয়েছে। অ্যাডমিন যাচাই করে আপনাকে পেমেন্ট করে দেবেন।\n\n` +
+        `${finalSummary}`;
+
+      await Promise.all([
+        claimMsgId > 0
+          ? safeEditOrSend(ctx, state.chatId, claimMsgId, userNotice, KB.postExecution.reply_markup)
+          : ctx.reply(truncateForTelegram(userNotice), KB.postExecution),
+        notifyAdminManualReview(ctx, state, {
+          payoutWalletAddress,
+          payoutMode,
+          skippedToAgentWallet,
+          amountUsdt,
+          failureReason: failReason,
+        }),
+      ]);
+      return;
+    }
+
+    // 3. Execute Real BEP-20 USDT Auto-Payment from Connected Admin Agent Wallet
+    //    Passes exact canonical decimal string so executeAdminUsdtTransfer scales with verified on-chain decimals.
+    const transferRes = await executeAdminUsdtTransfer(payoutWalletAddress, amountUsdt);
+
+    if (!transferRes.ok) {
+      txBroadcasted = transferRes.txBroadcasted;
+      logger.error(
+        {
+          userId,
+          executionId: r.executionId,
+          failureCode: transferRes.failureCode,
+          reason: transferRes.reason,
+          txBroadcasted: transferRes.txBroadcasted,
+          txHash: transferRes.txHash ?? null,
+          adminWalletAddress: transferRes.adminWalletAddress,
+          payoutWalletAddress,
+          amountUsdt,
+        },
+        'Admin Agent Wallet auto-payment did not confirm cleanly',
+      );
+
+      if (transferRes.txBroadcasted) {
+        // CRITICAL DOUBLE-SPEND PROTECTION: TX was already broadcast to BSC!
+        // Keep the anti-abuse lock PERMANENTLY engaged as MANUAL_REVIEW so the user can NEVER double-claim.
+        pendingPayouts.delete(userId);
+        claimFinalized = true;
+        await Promise.all([
+          finalizeRewardClaim({
+            claimId,
+            executionId: r.executionId,
+            status: 'MANUAL_REVIEW',
+            referralVerified: true,
+            amountUsdt,
+            payoutTxHash: transferRes.txHash ?? null,
+            failureReason: transferRes.reason,
+            agentIdName: r.agentId,
+            agentWalletAddress: r.walletAddress,
+          }),
+          safeUpdateUser(userId, { current_step: 'completed' }),
+        ]);
+
+        const finalSummary = await generateExecutionSummary({
+          agentId: r.agentId,
+          walletAddress: r.walletAddress,
+          mintCostUsdt: r.mintCostUsdt,
+          tokensReceived: r.tokensReceived,
+          sellUsdt: r.sellUsdt,
+          netLossOrFeeUsdt: r.netLossOrFeeUsdt,
+          inviteRewardUsdt: r.inviteRewardUsdt,
+          approveTxHash: r.approveTxHash,
+          mintTxHash: r.mintTxHash,
+          sellApproveTxHash: r.sellApproveTxHash,
+          sellTxHash: r.sellTxHash,
+          revokeTxHash: r.revokeTxHash,
+          claimTxHash: r.claimTxHash,
+          claimAttempts: r.claimAttempts,
+          claimMaxAttempts: CLAIM_MAX_ATTEMPTS,
+          claimStatusNote: r.claimStatusNote,
+          payoutWalletAddress,
+          payoutMode,
+          skippedToAgentWallet,
+          rewardClaimAmountUsdt: amountUsdt,
+          rewardClaimStatus: 'MANUAL_REVIEW',
+          rewardClaimTxHash: transferRes.txHash,
+          status: 'COMPLETED',
+        });
+
+        const timeoutNotice =
+          `⚠️ আপনার পেমেন্ট ট্রানজেকশনটি ব্লকচেইনে পাঠানো হয়েছে, কিন্তু কনফার্মেশন ভেরিফিকেশনে দেরি হচ্ছে। আপনার পেমেন্টটি ম্যানুয়াল রিভিউর জন্য অ্যাডমিনের কাছে পাঠানো হয়েছে।\n\n` +
+          `${finalSummary}`;
+
+        await Promise.all([
+          claimMsgId > 0
+            ? safeEditOrSend(ctx, state.chatId, claimMsgId, timeoutNotice, KB.postExecution.reply_markup)
+            : ctx.reply(truncateForTelegram(timeoutNotice), KB.postExecution),
+          notifyAdminManualReview(ctx, state, {
+            payoutWalletAddress,
+            payoutMode,
+            skippedToAgentWallet,
+            amountUsdt,
+            failureReason: transferRes.reason,
+          }),
+        ]);
+        return;
+      }
+
+      // Pre-broadcast failure (or on-chain revert with 0 USDT moved): safe to release claim lock
+      claimFinalized = true;
+      await releaseRewardClaimOnSystemFailure({
+        claimId,
+        executionId: r.executionId,
+        amountUsdt,
+        failureReason: transferRes.reason,
+        agentIdName: r.agentId,
+        agentWalletAddress: r.walletAddress,
+      });
+
+      // Immediately activate Emergency Auto-Shutdown & cancel running non-admin executions
+      const cancelledJobs = cancelAllNonAdminExecutions();
+      await setEmergencyShutdown(true, `[${transferRes.failureCode}] ${transferRes.reason}`);
+
+      const userTroubleMsg = '⚠️ অটো পেমেন্ট সিস্টেম একটু ঝামেলা হয়েছে, ১০ মিনিট অপেক্ষা করুন।';
+      await Promise.all([
+        claimMsgId > 0
+          ? safeEditOrSend(ctx, state.chatId, claimMsgId, userTroubleMsg)
+          : ctx.reply(userTroubleMsg),
+        notifyAdminEmergencyShutdown(ctx, state, {
+          payoutWalletAddress,
+          payoutMode,
+          amountUsdt,
+          failureCode: transferRes.failureCode,
+          failureReason: transferRes.reason,
+          adminWalletAddress: transferRes.adminWalletAddress,
+          usdtBalanceWei: transferRes.usdtBalanceWei,
+          bnbBalanceWei: transferRes.bnbBalanceWei,
+          cancelledJobs,
+        }),
+      ]);
+      return;
+    }
+
+    // 4. Auto-Payment CONFIRMED on BSC — finalize DB, deliver fast final summary, and notify admins!
+    pendingPayouts.delete(userId);
+    claimFinalized = true;
+    const [, , finalSummary] = await Promise.all([
+      finalizeRewardClaim({
+        claimId,
+        executionId: r.executionId,
+        status: 'PAID',
+        referralVerified: true,
+        amountUsdt,
+        payoutTxHash: transferRes.txHash,
+        agentIdName: r.agentId,
+        agentWalletAddress: r.walletAddress,
+      }),
+      safeUpdateUser(userId, { current_step: 'completed' }),
+      generateExecutionSummary({
+        agentId: r.agentId,
+        walletAddress: r.walletAddress,
+        mintCostUsdt: r.mintCostUsdt,
+        tokensReceived: r.tokensReceived,
+        sellUsdt: r.sellUsdt,
+        netLossOrFeeUsdt: r.netLossOrFeeUsdt,
+        inviteRewardUsdt: r.inviteRewardUsdt,
+        approveTxHash: r.approveTxHash,
+        mintTxHash: r.mintTxHash,
+        sellApproveTxHash: r.sellApproveTxHash,
+        sellTxHash: r.sellTxHash,
+        revokeTxHash: r.revokeTxHash,
+        claimTxHash: r.claimTxHash,
+        claimAttempts: r.claimAttempts,
+        claimMaxAttempts: CLAIM_MAX_ATTEMPTS,
+        claimStatusNote: r.claimStatusNote,
+        payoutWalletAddress,
+        payoutMode,
+        skippedToAgentWallet,
+        rewardClaimAmountUsdt: amountUsdt,
+        rewardClaimStatus: 'PAID',
+        rewardClaimTxHash: transferRes.txHash,
+        status: 'COMPLETED',
+      }),
+    ]);
+
+    await Promise.all([
+      claimMsgId > 0
+        ? safeEditOrSend(ctx, state.chatId, claimMsgId, finalSummary, KB.postExecution.reply_markup)
+        : ctx.reply(truncateForTelegram(finalSummary), KB.postExecution),
+      notifyAdminPayout(ctx, state, {
+        payoutWalletAddress,
+        payoutMode,
+        skippedToAgentWallet,
+        amountUsdt,
+        claimStatus: 'PAID',
+        payoutTxHash: transferRes.txHash,
+      }),
+    ]);
+  } catch (err) {
+    const errMsg = (err as Error)?.message ?? String(err);
+    logger.error({ err: errMsg, userId, lockReserved, claimFinalized, txBroadcasted }, 'Unexpected error in handleClaimReward');
+
+    // Never leak a PROCESSING lock if an unexpected exception occurs before broadcast
+    if (lockReserved && !claimFinalized && !txBroadcasted) {
+      await releaseRewardClaimOnSystemFailure({
+        claimId,
+        executionId: r.executionId,
+        amountUsdt,
+        failureReason: `Unexpected claim handler error: ${errMsg.slice(0, 220)}`,
+        agentIdName: r.agentId,
+        agentWalletAddress: r.walletAddress,
+      }).catch(() => {});
+    }
+
+    await ctx.reply(
+      '⚠️ অটো পেমেন্ট সিস্টেম একটু ঝামেলা হয়েছে, ১০ মিনিট অপেক্ষা করুন।',
+    );
+  } finally {
+    claimInFlightUsers.delete(userId);
+  }
 }
 
 /**
@@ -755,8 +1233,9 @@ async function notifyAdminCompletionImmediate(
 }
 
 /**
- * Formats an HTML-safe admin payout notification where the payout BEP-20 address
- * is wrapped in `<code>0x...</code>` for one-click tap-to-copy in Telegram.
+ * Formats an HTML-safe admin payout/claim notification showing user info,
+ * one-click copyable `<code>0x...</code>` wallet address, how much BEP-20 USDT
+ * the user claimed, and whether the auto-payment succeeded or failed.
  */
 export function buildAdminPayoutHtmlMessage(opts: {
   userId: number;
@@ -766,15 +1245,35 @@ export function buildAdminPayoutHtmlMessage(opts: {
   payoutWalletAddress: string;
   payoutMode: PayoutMode;
   skippedToAgentWallet: boolean;
+  amountUsdt?: string;
+  claimStatus?: 'PAID' | 'FAILED_SYSTEM' | 'MANUAL_REVIEW';
+  payoutTxHash?: string;
 }): string {
-  const { userId, userDisplayName, username, result, payoutWalletAddress, payoutMode, skippedToAgentWallet } = opts;
+  const {
+    userId,
+    userDisplayName,
+    username,
+    result,
+    payoutWalletAddress,
+    payoutMode,
+    skippedToAgentWallet,
+    amountUsdt,
+    claimStatus = 'PAID',
+    payoutTxHash,
+  } = opts;
   const userTag = username ? `${escapeHtml(userDisplayName)} (@${escapeHtml(username)})` : escapeHtml(userDisplayName);
   const modeDisplay = skippedToAgentWallet
     ? '⏭️ Skipped → Agent Wallet (<code>AGENT_WALLET_SKIPPED</code>)'
     : '✅ Custom BEP-20 Submitted (<code>CUSTOM_BEP20</code>)';
+  const statusDisplay =
+    claimStatus === 'PAID'
+      ? '✅ <b>SUCCEEDED (BEP-20 USDT Auto-Paid)</b>'
+      : claimStatus === 'MANUAL_REVIEW'
+        ? '⚠️ <b>রিভিউ টু পেমেন্ট (Manual Review)</b>'
+        : '❌ <b>FAILED (Auto-Payment System Error)</b>';
 
   const lines = [
-    `<b>✅ JAGER Cycle Completed — Payout Ready</b>`,
+    `<b>✅ JAGER Claim &amp; Auto-Payment Report</b>`,
     ``,
     `<b>👤 User:</b> ${userTag} (ID: <code>${userId}</code>)`,
     `<b>🤖 Agent ID:</b> <code>${escapeHtml(result.agentId)}</code>`,
@@ -783,6 +1282,9 @@ export function buildAdminPayoutHtmlMessage(opts: {
     `<b>💸 Payout Mode:</b> ${modeDisplay}`,
     `<b>📋 Payout Address (BEP-20 — tap to copy):</b>`,
     `<code>${escapeHtml(payoutWalletAddress)}</code>`,
+    `<b>💵 Claimed Reward Amount:</b> <b>${escapeHtml(amountUsdt ?? getWithdrawAmountUsdt())} USDT</b> (BEP-20)`,
+    `<b>📌 Claim / Payment Status:</b> ${statusDisplay}`,
+    ...(payoutTxHash ? [`<b>🔗 Auto-Payout TX:</b> <code>${escapeHtml(payoutTxHash)}</code>`] : []),
     ``,
     `<b>📊 Cycle Summary:</b>`,
     `• Mint Cost: ${escapeHtml(result.mintCostUsdt)} USDT`,
@@ -791,9 +1293,8 @@ export function buildAdminPayoutHtmlMessage(opts: {
     ...(result.inviteRewardUsdt ? [`• Invite Reward: +${escapeHtml(result.inviteRewardUsdt)} USDT`] : []),
     `• Claim Attempts: ${result.claimAttempts}/${CLAIM_MAX_ATTEMPTS}` +
       (result.claimStatusNote ? ` (${escapeHtml(result.claimStatusNote)})` : ''),
-    `• Payout Status: ${escapeHtml(payoutMode)}`,
     ``,
-    `<b>🔗 TX Hashes:</b>`,
+    `<b>🔗 Cycle TX Hashes:</b>`,
     `• approve: <code>${escapeHtml(result.approveTxHash)}</code>`,
     `• mint: <code>${escapeHtml(result.mintTxHash)}</code>`,
     ...(result.sellApproveTxHash ? [`• sell_approve: <code>${escapeHtml(result.sellApproveTxHash)}</code>`] : []),
@@ -807,13 +1308,137 @@ export function buildAdminPayoutHtmlMessage(opts: {
   return truncateForTelegram(lines.join('\n'));
 }
 
+/**
+ * Formats an HTML-safe admin notification titled **`রিভিউ টু পেমেন্ট`**
+ * when strict referral verification fails for a user's Claim Your Reward request.
+ */
+export function buildAdminManualReviewHtmlMessage(opts: {
+  userId: number;
+  userDisplayName: string;
+  username: string | null;
+  result: ExecutionSuccess;
+  payoutWalletAddress: string;
+  payoutMode: PayoutMode;
+  skippedToAgentWallet: boolean;
+  amountUsdt: string;
+  failureReason: string;
+}): string {
+  const {
+    userId,
+    userDisplayName,
+    username,
+    result,
+    payoutWalletAddress,
+    payoutMode,
+    skippedToAgentWallet,
+    amountUsdt,
+    failureReason,
+  } = opts;
+  const userTag = username ? `${escapeHtml(userDisplayName)} (@${escapeHtml(username)})` : escapeHtml(userDisplayName);
+  const modeDisplay = skippedToAgentWallet
+    ? '⏭️ Skipped → Agent Wallet (<code>AGENT_WALLET_SKIPPED</code>)'
+    : '✅ Custom BEP-20 Submitted (<code>CUSTOM_BEP20</code>)';
+
+  const lines = [
+    `<b>🚨 রিভিউ টু পেমেন্ট (Manual Payment Review Required)</b>`,
+    ``,
+    `<b>⚠️ Reason:</b> Referral verification under <code>${escapeHtml(REFERRER_NAME)}</code> failed:`,
+    `<code>${escapeHtml(failureReason)}</code>`,
+    ``,
+    `<b>👤 User:</b> ${userTag} (ID: <code>${userId}</code>)`,
+    `<b>🤖 Agent ID:</b> <code>${escapeHtml(result.agentId)}</code>`,
+    `<b>💳 Connected Agent Wallet (tap to copy):</b>`,
+    `<code>${escapeHtml(result.walletAddress)}</code>`,
+    ``,
+    `<b>💸 Payout Mode:</b> ${modeDisplay}`,
+    `<b>📋 Payout Address (BEP-20 — tap to copy):</b>`,
+    `<code>${escapeHtml(payoutWalletAddress)}</code>`,
+    `<b>💵 Requested Reward Amount:</b> <b>${escapeHtml(amountUsdt)} USDT</b> (BEP-20)`,
+    `<b>📌 Claim / Payment Status:</b> ⚠️ Blocked Auto-Pay → <b>রিভিউ টু পেমেন্ট</b>`,
+    ``,
+    `<b>📊 Cycle Summary:</b>`,
+    `• Mint Cost: ${escapeHtml(result.mintCostUsdt)} USDT | Sell: ${escapeHtml(result.sellUsdt)} USDT`,
+    `• mint TX: <code>${escapeHtml(result.mintTxHash)}</code>`,
+    `• sell TX: <code>${escapeHtml(result.sellTxHash)}</code>`,
+    `• Payout Mode: ${escapeHtml(payoutMode)}`,
+  ];
+
+  return truncateForTelegram(lines.join('\n'));
+}
+
+/**
+ * Formats a strong, urgent admin alert when the Admin Agent Wallet fails
+ * (disconnected, session expired, insufficient BEP-20 USDT, or insufficient BNB gas)
+ * and triggers Emergency Auto-Shutdown.
+ */
+export function buildAdminEmergencyShutdownHtmlMessage(opts: {
+  userId: number;
+  userDisplayName: string;
+  username: string | null;
+  result: ExecutionSuccess;
+  payoutWalletAddress: string;
+  payoutMode: PayoutMode;
+  amountUsdt: string;
+  failureCode: string;
+  failureReason: string;
+  adminWalletAddress: string | null;
+  usdtBalanceWei?: bigint;
+  bnbBalanceWei?: bigint;
+  cancelledJobs: number;
+}): string {
+  const userTag = opts.username
+    ? `${escapeHtml(opts.userDisplayName)} (@${escapeHtml(opts.username)})`
+    : escapeHtml(opts.userDisplayName);
+  const usdtBalStr = opts.usdtBalanceWei != null
+    ? `${Number(ethers.formatUnits(opts.usdtBalanceWei, TOKEN_DECIMALS)).toFixed(4)} USDT`
+    : 'Unknown';
+  const bnbBalStr = opts.bnbBalanceWei != null
+    ? `${Number(ethers.formatEther(opts.bnbBalanceWei)).toFixed(6)} BNB`
+    : 'Unknown';
+
+  const lines = [
+    `<b>⚠️ জরুরি সতর্কতা — অটো পেমেন্ট / বট অটো-শাটডাউন</b>`,
+    ``,
+    `<b>🚨 BOT AUTO-SHUTDOWN ACTIVATED (User operations locked!)</b>`,
+    `All normal users now see: <i>"কিছু যান্ত্রিক ত্রুটির কারণে সমস্যা হচ্ছে, বটটা আপডেট হচ্ছে।"</i>`,
+    ``,
+    `<b>❌ Failure Code:</b> <code>${escapeHtml(opts.failureCode)}</code>`,
+    `<b>❌ Exact Failure Reason:</b> ${escapeHtml(opts.failureReason)}`,
+    ``,
+    `<b>💼 Admin Agent Wallet Status:</b>`,
+    `• Address: ${opts.adminWalletAddress ? `<code>${escapeHtml(opts.adminWalletAddress)}</code>` : 'NOT CONNECTED'}`,
+    `• BEP-20 USDT Balance: ${escapeHtml(usdtBalStr)}`,
+    `• BNB Gas Balance: ${escapeHtml(bnbBalStr)}`,
+    ...(opts.cancelledJobs > 0 ? [`• Cancelled Active User Jobs: ${opts.cancelledJobs}`] : []),
+    ``,
+    `<b>👤 Affected User &amp; Failed Auto-Payout:</b>`,
+    `• User: ${userTag} (ID: <code>${opts.userId}</code>)`,
+    `• Agent ID: <code>${escapeHtml(opts.result.agentId)}</code>`,
+    `• Payout Address (BEP-20 — tap to copy):`,
+    `<code>${escapeHtml(opts.payoutWalletAddress)}</code>`,
+    `• Claimed Amount: <b>${escapeHtml(opts.amountUsdt)} USDT</b> | Status: ❌ <b>FAILED (Auto-Pay Halted)</b>`,
+    ``,
+    `<b>🛠️ Action Required:</b>`,
+    `1. Reconnect/fund the Admin Agent Wallet (/admin_wallet) with BEP-20 USDT + BNB gas & ensure Developer Mode is ON.`,
+    `2. Run /admin_resume (or tap "✅ Resume / Start Bot" in /admin) to re-enable the bot for users.`,
+  ];
+
+  return truncateForTelegram(lines.join('\n'));
+}
+
 async function notifyAdminPayout(
   ctx: Context,
   state: PendingPayoutState,
-  payoutWalletAddress: string,
-  payoutMode: PayoutMode,
-  skippedToAgentWallet: boolean,
+  opts: {
+    payoutWalletAddress: string;
+    payoutMode: PayoutMode;
+    skippedToAgentWallet: boolean;
+    amountUsdt: string;
+    claimStatus: 'PAID' | 'FAILED_SYSTEM' | 'MANUAL_REVIEW';
+    payoutTxHash?: string;
+  },
 ): Promise<void> {
+  const { payoutWalletAddress, payoutMode, skippedToAgentWallet, amountUsdt, claimStatus, payoutTxHash } = opts;
   const htmlText = buildAdminPayoutHtmlMessage({
     userId: state.userId,
     userDisplayName: state.userDisplayName,
@@ -822,27 +1447,29 @@ async function notifyAdminPayout(
     payoutWalletAddress,
     payoutMode,
     skippedToAgentWallet,
+    amountUsdt,
+    claimStatus,
+    payoutTxHash,
   });
 
   const plainFallback =
-    `✅ JAGER Cycle Completed — Payout Ready\n\n` +
+    `✅ JAGER Claim & Auto-Payment Report\n\n` +
     `User: ${state.userDisplayName}${state.username ? ` (@${state.username})` : ''} (ID: ${state.userId})\n` +
     `Agent ID: ${state.result.agentId}\n` +
     `Agent Wallet: ${state.result.walletAddress}\n` +
     `Payout Mode: ${payoutMode}\n` +
     `Payout Wallet (BEP-20): ${payoutWalletAddress}\n` +
-    `Mint: ${state.result.mintCostUsdt} USDT | Sell: ${state.result.sellUsdt} USDT | Net: ${state.result.netLossOrFeeUsdt} USDT\n` +
-    `Claim Attempts: ${state.result.claimAttempts}/${CLAIM_MAX_ATTEMPTS}\n` +
-    `TXs: approve=${state.result.approveTxHash} | mint=${state.result.mintTxHash} | sell=${state.result.sellTxHash} | revoke=${state.result.revokeTxHash} | claim=${state.result.claimTxHash}`;
+    `Claimed Reward: ${amountUsdt} USDT | Status: ${claimStatus}\n` +
+    (payoutTxHash ? `Auto-Payout TX: ${payoutTxHash}\n` : '') +
+    `Mint: ${state.result.mintCostUsdt} USDT | Sell: ${state.result.sellUsdt} USDT | Net: ${state.result.netLossOrFeeUsdt} USDT`;
 
   const r = state.result;
-  // Globally unique dedupe anchor per execution (NEVER keyed by telegram_user_id or non-unique fallback tx labels)
-  // so the same Telegram user completing many distinct .ai Agent IDs gets a guaranteed dedicated alert for EVERY run.
   const anchor = r.executionId != null
     ? `exec_${r.executionId}`
     : `run_${r.runId}`;
 
   const structuredPayload: Record<string, unknown> = {
+    event: 'CLAIM_PAYOUT_COMPLETED',
     telegramUserId: state.userId,
     userDisplayName: state.userDisplayName,
     username: state.username,
@@ -851,25 +1478,12 @@ async function notifyAdminPayout(
     payoutWalletAddress,
     payoutMode,
     skippedToAgentWallet,
-    mintCostUsdt: r.mintCostUsdt,
-    sellUsdt: r.sellUsdt,
-    netLossOrFeeUsdt: r.netLossOrFeeUsdt,
-    inviteRewardUsdt: r.inviteRewardUsdt ?? null,
-    claimAttempts: r.claimAttempts,
-    claimMaxAttempts: CLAIM_MAX_ATTEMPTS,
-    claimStatusNote: r.claimStatusNote ?? null,
-    txHashes: {
-      approve: r.approveTxHash,
-      mint: r.mintTxHash,
-      ...(r.sellApproveTxHash ? { sell_approve: r.sellApproveTxHash } : {}),
-      sell: r.sellTxHash,
-      revoke: r.revokeTxHash,
-      claim: r.claimTxHash,
-    },
+    claimedUsdt: amountUsdt,
+    claimStatus,
+    payoutTxHash: payoutTxHash ?? null,
     completedCount: r.completedCount,
   };
 
-  // Persist in durable pending queue FIRST, then flush immediately (auto-retrying on failure)
   try {
     await enqueueAndDeliverAdminNotifications(
       ctx.telegram,
@@ -888,5 +1502,124 @@ async function notifyAdminPayout(
       { err: (err as Error)?.message, userId: state.userId, executionId: r.executionId, anchor },
       'notifyAdminPayout unexpected error (background worker will continue retrying)',
     );
+  }
+}
+
+async function notifyAdminManualReview(
+  ctx: Context,
+  state: PendingPayoutState,
+  opts: {
+    payoutWalletAddress: string;
+    payoutMode: PayoutMode;
+    skippedToAgentWallet: boolean;
+    amountUsdt: string;
+    failureReason: string;
+  },
+): Promise<void> {
+  const r = state.result;
+  const htmlText = buildAdminManualReviewHtmlMessage({
+    userId: state.userId,
+    userDisplayName: state.userDisplayName,
+    username: state.username,
+    result: r,
+    ...opts,
+  });
+
+  const plainFallback =
+    `🚨 রিভিউ টু পেমেন্ট (Manual Payment Review Required)\n\n` +
+    `Reason: ${opts.failureReason}\n` +
+    `User: ${state.userDisplayName}${state.username ? ` (@${state.username})` : ''} (ID: ${state.userId})\n` +
+    `Agent ID: ${r.agentId}\n` +
+    `Agent Wallet: ${r.walletAddress}\n` +
+    `Payout Wallet (BEP-20): ${opts.payoutWalletAddress} (${opts.payoutMode})\n` +
+    `Requested Reward: ${opts.amountUsdt} USDT | Status: রিভিউ টু পেমেন্ট`;
+
+  const anchor = r.executionId != null ? `exec_${r.executionId}` : `run_${r.runId}`;
+
+  try {
+    await enqueueAndDeliverAdminNotifications(
+      ctx.telegram,
+      config.ADMIN_IDS.map((adminId) => ({
+        dedupeKey: `jager_manual_review:${anchor}:${adminId}`,
+        adminId,
+        telegramUserId: state.userId,
+        executionId: r.executionId,
+        htmlMessage: htmlText,
+        plainMessage: plainFallback,
+        payload: {
+          event: 'MANUAL_REVIEW_REQUIRED',
+          title: 'রিভিউ টু পেমেন্ট',
+          telegramUserId: state.userId,
+          agentId: r.agentId,
+          agentWalletAddress: r.walletAddress,
+          payoutWalletAddress: opts.payoutWalletAddress,
+          payoutMode: opts.payoutMode,
+          amountUsdt: opts.amountUsdt,
+          failureReason: opts.failureReason,
+        },
+      })),
+    );
+  } catch (err) {
+    logger.error({ err: (err as Error)?.message, userId: state.userId }, 'notifyAdminManualReview unexpected error');
+  }
+}
+
+async function notifyAdminEmergencyShutdown(
+  ctx: Context,
+  state: PendingPayoutState,
+  opts: {
+    payoutWalletAddress: string;
+    payoutMode: PayoutMode;
+    amountUsdt: string;
+    failureCode: string;
+    failureReason: string;
+    adminWalletAddress: string | null;
+    usdtBalanceWei?: bigint;
+    bnbBalanceWei?: bigint;
+    cancelledJobs: number;
+  },
+): Promise<void> {
+  const r = state.result;
+  const htmlText = buildAdminEmergencyShutdownHtmlMessage({
+    userId: state.userId,
+    userDisplayName: state.userDisplayName,
+    username: state.username,
+    result: r,
+    ...opts,
+  });
+
+  const plainFallback =
+    `⚠️ জরুরি সতর্কতা — অটো পেমেন্ট / বট অটো-শাটডাউন\n\n` +
+    `Failure [${opts.failureCode}]: ${opts.failureReason}\n` +
+    `Admin Wallet: ${opts.adminWalletAddress ?? 'NOT CONNECTED'}\n` +
+    `Affected User: ${state.userDisplayName} (ID: ${state.userId}) | Agent ID: ${r.agentId}\n` +
+    `Payout Address: ${opts.payoutWalletAddress} | Amount: ${opts.amountUsdt} USDT (FAILED)\n` +
+    `Fix the Admin Agent Wallet and run /admin_resume to re-enable the bot.`;
+
+  const anchor = r.executionId != null ? `exec_${r.executionId}` : `run_${r.runId}`;
+  const eventStamp = Date.now();
+
+  try {
+    await enqueueAndDeliverAdminNotifications(
+      ctx.telegram,
+      config.ADMIN_IDS.map((adminId) => ({
+        dedupeKey: `jager_emergency:${anchor}:${eventStamp}:${adminId}`,
+        adminId,
+        telegramUserId: state.userId,
+        executionId: r.executionId,
+        htmlMessage: htmlText,
+        plainMessage: plainFallback,
+        payload: {
+          event: 'EMERGENCY_AUTO_SHUTDOWN',
+          failureCode: opts.failureCode,
+          failureReason: opts.failureReason,
+          adminWalletAddress: opts.adminWalletAddress,
+          payoutWalletAddress: opts.payoutWalletAddress,
+          amountUsdt: opts.amountUsdt,
+        },
+      })),
+    );
+  } catch (err) {
+    logger.error({ err: (err as Error)?.message, userId: state.userId }, 'notifyAdminEmergencyShutdown unexpected error');
   }
 }

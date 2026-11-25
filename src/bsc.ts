@@ -83,8 +83,10 @@ export const JAGENT_MINT_PRICE_BPS = 9_900n;
 export const TOKEN_DECIMALS        = 18;
 
 /** Minimum BNB required for LOW/MEDIUM gas across the 4-5 cycle transactions. */
-export const MIN_BNB_GAS           = ethers.parseEther('0.003');
-export const RECOMMENDED_BNB_GAS   = ethers.parseEther('0.005');
+export const MIN_BNB_GAS              = ethers.parseEther('0.003');
+export const RECOMMENDED_BNB_GAS      = ethers.parseEther('0.005');
+/** Minimum BNB gas required on Admin Agent Wallet to send an ERC-20 BEP-20 USDT transfer. */
+export const MIN_ADMIN_PAYOUT_BNB_GAS = ethers.parseEther('0.0005');
 
 // ─── Verified ABIs (JagentMintV2 + JagentTokenV2 on BSC chainId 56) ──────────
 
@@ -129,6 +131,7 @@ const AGENT_REGISTRY_ABI = [
 const ERC20_ABI = [
   'function balanceOf(address owner) external view returns (uint256)',
   'function approve(address spender, uint256 amount) external returns (bool)',
+  'function transfer(address to, uint256 amount) external returns (bool)',
   'function allowance(address owner, address spender) external view returns (uint256)',
   'function decimals() external view returns (uint8)',
   'event Transfer(address indexed from, address indexed to, uint256 value)',
@@ -278,6 +281,7 @@ export interface JagerAgentStatusApi {
   siteEntryOpen: boolean | null;
   pendingUsdt: number;
   paidUsdt: number;
+  referrer: string | null;
 }
 
 /** Queries live wallet status from https://jager.live/api/agent/status?address=<wallet>. */
@@ -295,6 +299,12 @@ export async function fetchJagerAgentStatus(rawWalletAddress: string): Promise<J
     const mint   = (raw.mint   && typeof raw.mint   === 'object' ? raw.mint   : {}) as Record<string, unknown>;
     const invite = (raw.invite && typeof raw.invite === 'object' ? raw.invite : {}) as Record<string, unknown>;
 
+    const rawRef =
+      raw.referrer ?? raw.inviter ?? raw.invitedBy ?? raw.ref ??
+      invite.referrer ?? invite.inviter ?? invite.invitedBy ??
+      mint.referrer ?? mint.inviter ?? null;
+    const referrer = typeof rawRef === 'string' && rawRef.trim().length > 0 ? rawRef.trim() : null;
+
     return {
       agentId: typeof raw.agentId === 'string' && raw.agentId.trim() ? raw.agentId.trim() : null,
       minted: mint.minted != null && Number.isFinite(Number(mint.minted)) ? Number(mint.minted) : null,
@@ -304,6 +314,7 @@ export async function fetchJagerAgentStatus(rawWalletAddress: string): Promise<J
       siteEntryOpen: typeof mint.siteEntryOpen === 'boolean' ? mint.siteEntryOpen : null,
       pendingUsdt: Number.isFinite(Number(invite.pendingUsdt)) ? Number(invite.pendingUsdt) : 0,
       paidUsdt: Number.isFinite(Number(invite.paidUsdt)) ? Number(invite.paidUsdt) : 0,
+      referrer,
     };
   } catch (err) {
     logger.warn({ err: (err as Error)?.message }, 'fetchJagerAgentStatus failed (non-fatal)');
@@ -450,6 +461,26 @@ export async function readMintPaused(): Promise<boolean> {
   return Boolean(await mintContract().paused());
 }
 
+let cachedUsdtDecimals: number | null = null;
+
+/**
+ * Reads and caches on-chain `decimals()` from BSC BEP-20 USDT
+ * (`0x55d398326f99059fF775485246999027B3197955`), verifying exact decimal precision (18).
+ */
+export async function readUsdtDecimals(): Promise<number> {
+  if (cachedUsdtDecimals != null) return cachedUsdtDecimals;
+  try {
+    const dec = Number(await usdtContract().decimals());
+    if (Number.isInteger(dec) && dec >= 6 && dec <= 18) {
+      cachedUsdtDecimals = dec;
+      return dec;
+    }
+  } catch (err) {
+    logger.warn({ err: (err as Error)?.message }, 'readUsdtDecimals RPC failed — using verified BSC USDT 18 decimals');
+  }
+  return TOKEN_DECIMALS;
+}
+
 export async function readUsdtBalance(address: string): Promise<bigint> {
   const owner = normalizeAddress(address, 'readUsdtBalance.owner');
   return BigInt(await usdtContract().balanceOf(owner));
@@ -502,6 +533,7 @@ export type ReceiptPollResult =
       mintedJagentFromLogs: bigint;
       mintPaidUsdtFromLogs: bigint;
       usdtReceivedFromLogs: bigint;
+      usdtTransferredExactMatch: boolean;
     }
   | { state: 'reverted'; receipt: ethers.TransactionReceipt }
   | { state: 'cancelled' }
@@ -512,7 +544,7 @@ export type ReceiptPollResult =
  * Parses confirmed (`status === 1`) receipts for:
  *   - JAGENT Transfer logs into `walletAddress` (exact tokens received from mint)
  *   - JagentMintV2 `Minted` event `paid` (exact USDT spent on mint)
- *   - USDT Transfer logs into `walletAddress` (exact USDT received from PancakeSwap sell)
+ *   - USDT Transfer logs into `walletAddress` (exact USDT received from PancakeSwap sell or Admin BEP-20 payout)
  */
 export async function pollTransactionReceipt(
   txHash: string,
@@ -520,6 +552,8 @@ export async function pollTransactionReceipt(
     timeoutMs?: number;
     pollIntervalMs?: number;
     walletAddress?: string;
+    expectedUsdtFrom?: string;
+    expectedUsdtAmountWei?: bigint;
     isCancelled?: () => boolean;
   },
 ): Promise<ReceiptPollResult> {
@@ -528,6 +562,10 @@ export async function pollTransactionReceipt(
   const targetWallet   = opts?.walletAddress
     ? normalizeAddress(opts.walletAddress, 'pollReceipt.walletAddress').toLowerCase()
     : null;
+  const expectedFromLower = opts?.expectedUsdtFrom
+    ? normalizeAddress(opts.expectedUsdtFrom, 'pollReceipt.expectedUsdtFrom').toLowerCase()
+    : null;
+  const expectedUsdtAmt = opts?.expectedUsdtAmountWei ?? null;
   const jagentLower    = ADDR.JAGENT_TOKEN.toLowerCase();
   const usdtLower      = ADDR.USDT.toLowerCase();
   const mintLower      = ADDR.MINT_CONTRACT.toLowerCase();
@@ -544,6 +582,7 @@ export async function pollTransactionReceipt(
           let mintPaidUsdtFromLogs = 0n;
           let usdtReceivedFromLogs = 0n;
           let usdtSpentToMintLogs  = 0n;
+          let matchedExpectedTransfer = 0n;
 
           for (const log of receipt.logs) {
             const addrLower = log.address.toLowerCase();
@@ -573,6 +612,9 @@ export async function pollTransactionReceipt(
                   const val      = BigInt(parsed.args[2]);
                   if (toAddr === targetWallet) {
                     usdtReceivedFromLogs += val;
+                    if (!expectedFromLower || fromAddr === expectedFromLower) {
+                      matchedExpectedTransfer += val;
+                    }
                   }
                   if (fromAddr === targetWallet && toAddr === mintLower) {
                     usdtSpentToMintLogs += val;
@@ -586,6 +628,9 @@ export async function pollTransactionReceipt(
             mintPaidUsdtFromLogs = usdtSpentToMintLogs;
           }
 
+          const usdtTransferredExactMatch =
+            expectedUsdtAmt != null ? matchedExpectedTransfer === expectedUsdtAmt : true;
+
           logger.info(
             {
               txHash,
@@ -595,6 +640,7 @@ export async function pollTransactionReceipt(
               mintedJagentFromLogs: mintedJagentFromLogs.toString(),
               mintPaidUsdtFromLogs: mintPaidUsdtFromLogs.toString(),
               usdtReceivedFromLogs: usdtReceivedFromLogs.toString(),
+              usdtTransferredExactMatch,
             },
             'BSC transaction receipt confirmed',
           );
@@ -604,6 +650,7 @@ export async function pollTransactionReceipt(
             mintedJagentFromLogs,
             mintPaidUsdtFromLogs,
             usdtReceivedFromLogs,
+            usdtTransferredExactMatch,
           };
         }
 
@@ -1333,6 +1380,281 @@ export function buildUsdtApproveCalldata(
 ): string {
   const spender = normalizeAddress(spenderAddress, 'usdtApprove.spender');
   return erc20Iface.encodeFunctionData('approve', [spender, amount]);
+}
+
+/**
+ * Builds ERC-20 `transfer(address to, uint256 amount)` calldata for BSC BEP-20 USDT
+ * (`0x55d398326f99059fF775485246999027B3197955`). Used by the Admin Auto-Payment System.
+ */
+export function buildUsdtTransferCalldata(
+  recipientAddress: string,
+  amountWei: bigint,
+): string {
+  const recipient = normalizeAddress(recipientAddress, 'usdtTransfer.recipient');
+  if (recipient === ethers.ZeroAddress) {
+    throw new Error('Cannot transfer BEP-20 USDT to zero address');
+  }
+  if (amountWei <= 0n) {
+    throw new Error('BEP-20 USDT transfer amount must be > 0');
+  }
+  return erc20Iface.encodeFunctionData('transfer', [recipient, amountWei]);
+}
+
+export interface ReferralVerificationResult {
+  verified: boolean;
+  reason?: string;
+  observedReferrer?: string | null;
+  onChainMintVerified: boolean;
+  onChainOwnerVerified: boolean;
+}
+
+/**
+ * Strict on-chain + account-state verification that the Agent ID / Agent Wallet
+ * that completed the JAGER cycle was opened/minted under our hardcoded referrer
+ * (`noyonislam.ai` / `0x85377229b28515432cCF1e1c4999BB71C9AdBE11`).
+ *
+ * Verification checks (all must pass for auto-payout):
+ *   1. Confirmed on-chain mint TX on BSC Mainnet (`chainId: 56`):
+ *      - `tx.to == ADDR.MINT_CONTRACT`
+ *      - `tx.from == agentWalletAddress`
+ *      - `receipt.status === 1`
+ *      - Decoded `mint(uint256 shares, address referrer, uint256 maxCost)` has
+ *        `referrer === ADDR.REFERRER` (`0x85377229b28515432cCF1e1c4999BB71C9AdBE11`)
+ *        and `shares >= 10n`.
+ *      - Receipt emits `Minted(minter, agentTokenId, ...)` matching `agentWalletAddress`.
+ *   2. On-chain `JagentMintV2` + `AgentRegistry` state confirms the Agent Wallet owns
+ *      the `.ai` Agent ID (`ownerValid === true`) and `mintedCount >= 10n` (`paidOnce === true`).
+ *   3. Live `jager.live/api/agent/status` cross-check: if a `referrer`/`inviter` field is
+ *      returned, it MUST match `noyonislam.ai` or `ADDR.REFERRER` (any mismatch fails).
+ */
+export async function verifyAgentReferrerOnChain(opts: {
+  agentWalletAddress: string;
+  agentIdName?: string | null;
+  mintTxHash?: string | null;
+}): Promise<ReferralVerificationResult> {
+  let wallet: string;
+  try {
+    wallet = normalizeAddress(opts.agentWalletAddress, 'verifyRef.agentWallet');
+  } catch {
+    return {
+      verified: false,
+      reason: 'Invalid Agent Wallet address.',
+      onChainMintVerified: false,
+      onChainOwnerVerified: false,
+    };
+  }
+
+  const walletLower = wallet.toLowerCase();
+  const expectedRefLower = ADDR.REFERRER.toLowerCase();
+  const expectedRefNameLower = REFERRER_NAME.toLowerCase();
+  const mintHash = opts.mintTxHash?.trim() ?? '';
+
+  if (!/^0x[0-9a-fA-F]{64}$/.test(mintHash)) {
+    return {
+      verified: false,
+      reason: `Missing valid on-chain mint transaction hash to verify referrer (${mintHash || 'none'}).`,
+      onChainMintVerified: false,
+      onChainOwnerVerified: false,
+    };
+  }
+
+  try {
+    const [tx, receipt, onChainQuota, apiStatus] = await Promise.all([
+      provider.getTransaction(mintHash),
+      provider.getTransactionReceipt(mintHash),
+      readOnChainAgentQuota(wallet),
+      fetchJagerAgentStatus(wallet),
+    ]);
+
+    // 1. Validate on-chain mint transaction & decoded referrer argument
+    if (!tx || !receipt) {
+      return {
+        verified: false,
+        reason: `On-chain mint transaction ${mintHash.slice(0, 12)}… not found on BSC.`,
+        onChainMintVerified: false,
+        onChainOwnerVerified: false,
+      };
+    }
+
+    if (receipt.status !== 1) {
+      return {
+        verified: false,
+        reason: `Mint transaction ${mintHash.slice(0, 12)}… reverted on-chain (status=${receipt.status}).`,
+        onChainMintVerified: false,
+        onChainOwnerVerified: false,
+      };
+    }
+
+    if (!tx.to || tx.to.toLowerCase() !== ADDR.MINT_CONTRACT.toLowerCase()) {
+      return {
+        verified: false,
+        reason: `Mint TX target (${tx.to ?? 'null'}) does not match JAGER Mint Contract.`,
+        onChainMintVerified: false,
+        onChainOwnerVerified: false,
+      };
+    }
+
+    if (!tx.from || tx.from.toLowerCase() !== walletLower) {
+      return {
+        verified: false,
+        reason: `Mint TX sender (${tx.from ?? 'null'}) does not match Agent Wallet (${wallet}).`,
+        onChainMintVerified: false,
+        onChainOwnerVerified: false,
+      };
+    }
+
+    let decodedRef = '';
+    let decodedShares = 0n;
+    try {
+      const parsedTx = mintIface.parseTransaction({ data: tx.data, value: tx.value });
+      if (!parsedTx || parsedTx.name !== 'mint') {
+        return {
+          verified: false,
+          reason: `Mint TX calldata did not invoke JagentMintV2.mint().`,
+          onChainMintVerified: false,
+          onChainOwnerVerified: false,
+        };
+      }
+      decodedShares = BigInt(parsedTx.args[0]);
+      decodedRef = normalizeAddress(String(parsedTx.args[1]), 'verifyRef.txReferrer');
+    } catch (decodeErr) {
+      return {
+        verified: false,
+        reason: `Failed to decode on-chain mint() referrer calldata: ${(decodeErr as Error)?.message ?? 'decode error'}.`,
+        onChainMintVerified: false,
+        onChainOwnerVerified: false,
+      };
+    }
+
+    if (decodedShares < MINT_SHARES) {
+      return {
+        verified: false,
+        reason: `Mint TX minted only ${decodedShares.toString()} share(s) (expected ${MINT_SHARES.toString()}).`,
+        observedReferrer: decodedRef,
+        onChainMintVerified: false,
+        onChainOwnerVerified: false,
+      };
+    }
+
+    if (decodedRef.toLowerCase() !== expectedRefLower) {
+      return {
+        verified: false,
+        reason: `On-chain mint referrer mismatch: found ${decodedRef}, expected ${ADDR.REFERRER} (${REFERRER_NAME}).`,
+        observedReferrer: decodedRef,
+        onChainMintVerified: false,
+        onChainOwnerVerified: false,
+      };
+    }
+
+    // Confirm Minted event emitted by JagentMintV2 for this minter wallet
+    const mintContractLower = ADDR.MINT_CONTRACT.toLowerCase();
+    let mintedLogMatched = false;
+    for (const log of receipt.logs) {
+      if (log.address.toLowerCase() !== mintContractLower) continue;
+      try {
+        const parsedLog = mintIface.parseLog({ topics: [...log.topics], data: log.data });
+        if (parsedLog?.name === 'Minted') {
+          const minterAddr = String(parsedLog.args[0] ?? '').toLowerCase();
+          const logShares  = BigInt(parsedLog.args[3] ?? 0);
+          if (minterAddr === walletLower && logShares >= MINT_SHARES) {
+            mintedLogMatched = true;
+            break;
+          }
+        }
+      } catch { /* non-Minted log */ }
+    }
+
+    if (!mintedLogMatched) {
+      return {
+        verified: false,
+        reason: `Confirmed mint TX receipt did not contain a matching Minted event for ${wallet}.`,
+        observedReferrer: decodedRef,
+        onChainMintVerified: false,
+        onChainOwnerVerified: false,
+      };
+    }
+
+    // 2. Verify on-chain Agent Registry ownership & completed mint state
+    if (!onChainQuota.available || !onChainQuota.ownerValid) {
+      return {
+        verified: false,
+        reason: `Agent Wallet ${wallet} does not hold a valid on-chain .ai Agent ID on JAGER registrar.`,
+        observedReferrer: decodedRef,
+        onChainMintVerified: true,
+        onChainOwnerVerified: false,
+      };
+    }
+
+    if (onChainQuota.mintedCount < MINT_SHARES && !onChainQuota.paidOnce) {
+      return {
+        verified: false,
+        reason: `On-chain JAGER contract shows mintedCount=${onChainQuota.mintedCount.toString()} (paidOnce=${onChainQuota.paidOnce}).`,
+        observedReferrer: decodedRef,
+        onChainMintVerified: true,
+        onChainOwnerVerified: false,
+      };
+    }
+
+    // If an expected agentIdName was passed, ensure it matches the on-chain handle
+    const cleanExpectedAgent = opts.agentIdName?.trim().toLowerCase() ?? '';
+    const onChainFullHandle = onChainQuota.handle
+      ? (onChainQuota.handle.toLowerCase().endsWith('.ai') ? onChainQuota.handle.toLowerCase() : `${onChainQuota.handle.toLowerCase()}.ai`)
+      : '';
+    if (isValidAiAgentId(cleanExpectedAgent) && onChainFullHandle && cleanExpectedAgent !== onChainFullHandle) {
+      return {
+        verified: false,
+        reason: `Agent ID mismatch: claimed "${cleanExpectedAgent}", on-chain handle is "${onChainFullHandle}".`,
+        observedReferrer: decodedRef,
+        onChainMintVerified: true,
+        onChainOwnerVerified: false,
+      };
+    }
+
+    // 3. Cross-check jager.live API referrer/inviter metadata (if returned by platform)
+    if (apiStatus?.referrer) {
+      const apiRefLower = apiStatus.referrer.trim().toLowerCase();
+      const matchesExpected =
+        apiRefLower === expectedRefLower ||
+        apiRefLower === expectedRefNameLower ||
+        apiRefLower === expectedRefNameLower.replace(/\.ai$/, '');
+      if (!matchesExpected) {
+        return {
+          verified: false,
+          reason: `jager.live account referrer mismatch: account linked to "${apiStatus.referrer}", expected "${REFERRER_NAME}" (${ADDR.REFERRER}).`,
+          observedReferrer: apiStatus.referrer,
+          onChainMintVerified: true,
+          onChainOwnerVerified: true,
+        };
+      }
+    }
+
+    logger.info(
+      {
+        wallet,
+        agentId: onChainFullHandle || opts.agentIdName || null,
+        mintTxHash: mintHash,
+        verifiedReferrer: decodedRef,
+        apiReferrer: apiStatus?.referrer ?? null,
+      },
+      'Strict on-chain & account referral verification PASSED',
+    );
+
+    return {
+      verified: true,
+      observedReferrer: decodedRef,
+      onChainMintVerified: true,
+      onChainOwnerVerified: true,
+    };
+  } catch (err) {
+    const msg = (err as Error)?.message ?? String(err);
+    logger.warn({ wallet, mintTxHash: mintHash, err: msg }, 'verifyAgentReferrerOnChain error');
+    return {
+      verified: false,
+      reason: `Referral verification check failed (${msg.slice(0, 160)}).`,
+      onChainMintVerified: false,
+      onChainOwnerVerified: false,
+    };
+  }
 }
 
 /**
