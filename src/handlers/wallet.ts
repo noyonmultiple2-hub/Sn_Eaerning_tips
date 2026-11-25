@@ -22,8 +22,13 @@ import {
 } from '../db.js';
 import { isUserLocked } from '../executor.js';
 import { isAwaitingPayoutWallet } from './execute.js';
+import { isAdminId } from '../config.js';
 import { KB } from '../keyboards.js';
 import { logger } from '../logger.js';
+
+const ADMIN_USER_MODE_BLOCKED_MSG =
+  '🛡️ Admin Role Isolation: Admin accounts cannot use regular user wallet pairing or task execution.\n\n' +
+  'Use /admin → "💼 Connect Admin Wallet" (/admin_wallet) to manage the Admin Auto-Payment Treasury Wallet.';
 
 async function safeAnswerCb(ctx: Context, text?: string): Promise<void> {
   try { if (ctx.callbackQuery) await ctx.answerCbQuery(text); } catch { /* ok */ }
@@ -123,6 +128,12 @@ async function checkConnectedWalletStatus(
 export async function handleConnectWallet(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
   if (!userId) return;
+
+  if (isAdminId(userId)) {
+    await safeAnswerCb(ctx, 'Admin accounts use Admin Dashboard');
+    await ctx.reply(ADMIN_USER_MODE_BLOCKED_MSG, KB.adminMenu);
+    return;
+  }
 
   if (isUserLocked(userId)) {
     await safeAnswerCb(ctx, 'Job currently running');
@@ -274,6 +285,12 @@ export async function handleConnectWallet(ctx: Context): Promise<void> {
 export async function handleSwitchWallet(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
   if (!userId) return;
+
+  if (isAdminId(userId)) {
+    await safeAnswerCb(ctx, 'Admin accounts use Admin Dashboard');
+    await ctx.reply(ADMIN_USER_MODE_BLOCKED_MSG, KB.adminMenu);
+    return;
+  }
 
   if (isUserLocked(userId)) {
     await safeAnswerCb(ctx, 'Job currently running');

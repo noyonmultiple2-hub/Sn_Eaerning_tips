@@ -3,6 +3,7 @@
 // and user/admin queries.
 
 import { Pool, PoolConfig } from 'pg';
+import { ethers } from 'ethers';
 import { config } from './config.js';
 import { logger } from './logger.js';
 
@@ -34,6 +35,11 @@ export const pool = new Pool(buildPoolConfig(config.SUPABASE_DB_URL));
 
 let dbReady = false;
 let botPausedCache = false;
+let emergencyShutdownCache = false;
+let emergencyShutdownReasonCache: string | null = null;
+let withdrawAmountUsdtCache = '1.00';
+let adminWalletAddressCache: string | null = null;
+let adminWalletConnectedCache = false;
 
 export function isDbAvailable(): boolean {
   return dbReady;
@@ -44,17 +50,72 @@ export function isBotPaused(): boolean {
   return botPausedCache;
 }
 
+/** Returns whether Emergency Auto-Shutdown / Maintenance mode is active for users. */
+export function isEmergencyShutdown(): boolean {
+  return emergencyShutdownCache;
+}
+
+/** Returns the exact runtime failure reason that triggered Emergency Auto-Shutdown. */
+export function getEmergencyShutdownReason(): string | null {
+  return emergencyShutdownReasonCache;
+}
+
+/** Returns the configured BEP-20 USDT reward amount per completed user claim. */
+export function getWithdrawAmountUsdt(): string {
+  return withdrawAmountUsdtCache;
+}
+
+/** Returns cached Admin Agent Wallet configuration (address & connected flag). */
+export function getAdminWalletConfig(): { connected: boolean; address: string | null } {
+  return {
+    connected: adminWalletConnectedCache,
+    address: adminWalletAddressCache,
+  };
+}
+
+async function upsertBotSetting(key: string, value: string): Promise<boolean> {
+  try {
+    await pool.query(
+      `INSERT INTO bot_settings (key, value, updated_at)
+       VALUES ($1, $2, now())
+       ON CONFLICT (key) DO UPDATE
+         SET value = EXCLUDED.value,
+             updated_at = now()`,
+      [key, value],
+    );
+    dbReady = true;
+    return true;
+  } catch (err) {
+    logger.warn({ err: (err as Error)?.message, key }, 'upsertBotSetting failed (kept in memory)');
+    return false;
+  }
+}
+
 /** Reloads persisted `bot_paused` state from PostgreSQL/Supabase. */
 export async function loadBotPausedState(): Promise<boolean> {
   try {
-    const { rows } = await pool.query<{ value: string }>(
-      `SELECT value FROM bot_settings WHERE key = 'bot_paused' LIMIT 1`,
+    const { rows } = await pool.query<{ key: string; value: string }>(
+      `SELECT key, value FROM bot_settings
+       WHERE key IN (
+         'bot_paused', 'maintenance_mode', 'maintenance_reason',
+         'withdraw_amount_usdt', 'admin_wallet_address', 'admin_wallet_connected'
+       )`,
     );
     dbReady = true;
-    botPausedCache = rows[0]?.value === 'true';
+    const map = new Map(rows.map((r) => [r.key, r.value]));
+    botPausedCache = map.get('bot_paused') === 'true';
+    emergencyShutdownCache = map.get('maintenance_mode') === 'true';
+    emergencyShutdownReasonCache = map.get('maintenance_reason') || null;
+    const wAmt = map.get('withdraw_amount_usdt');
+    if (wAmt) {
+      const parsed = parseAndFormatWithdrawAmountUsdt(wAmt);
+      if (parsed.ok) withdrawAmountUsdtCache = parsed.amount;
+    }
+    adminWalletAddressCache = map.get('admin_wallet_address') || null;
+    adminWalletConnectedCache = map.get('admin_wallet_connected') === 'true' && Boolean(adminWalletAddressCache);
     return botPausedCache;
   } catch (err) {
-    logger.warn({ err }, 'loadBotPausedState failed — using in-memory botPausedCache');
+    logger.warn({ err }, 'loadBotPausedState failed — using in-memory caches');
     return botPausedCache;
   }
 }
@@ -64,22 +125,109 @@ export async function setBotPaused(
   paused: boolean,
 ): Promise<{ paused: boolean; persisted: boolean }> {
   botPausedCache = paused;
-  try {
-    await pool.query(
-      `INSERT INTO bot_settings (key, value, updated_at)
-       VALUES ('bot_paused', $1, now())
-       ON CONFLICT (key) DO UPDATE
-         SET value = EXCLUDED.value,
-             updated_at = now()`,
-      [paused ? 'true' : 'false'],
-    );
-    dbReady = true;
-    logger.info({ botPaused: paused }, 'Updated bot_paused state in database');
-    return { paused, persisted: true };
-  } catch (err) {
-    logger.warn({ err, botPaused: paused }, 'setBotPaused: DB write failed (applied in memory)');
-    return { paused, persisted: false };
+  const persisted = await upsertBotSetting('bot_paused', paused ? 'true' : 'false');
+  logger.info({ botPaused: paused, persisted }, 'Updated bot_paused state');
+  return { paused, persisted };
+}
+
+/**
+ * Activates or clears Emergency Auto-Shutdown / Maintenance mode (`maintenance_mode`).
+ * When active, all non-admin user actions are blocked with the Bangla maintenance notice.
+ */
+export async function setEmergencyShutdown(
+  active: boolean,
+  reason?: string | null,
+): Promise<{ active: boolean; reason: string | null; persisted: boolean }> {
+  emergencyShutdownCache = active;
+  emergencyShutdownReasonCache = active ? (reason?.trim() || 'Auto-payment wallet failure') : null;
+  const [p1, p2] = await Promise.all([
+    upsertBotSetting('maintenance_mode', active ? 'true' : 'false'),
+    upsertBotSetting('maintenance_reason', emergencyShutdownReasonCache ?? ''),
+  ]);
+  const persisted = p1 && p2;
+  logger.warn(
+    { emergencyShutdown: active, reason: emergencyShutdownReasonCache, persisted },
+    active ? 'EMERGENCY AUTO-SHUTDOWN ACTIVATED' : 'Emergency Auto-Shutdown cleared by admin',
+  );
+  return { active, reason: emergencyShutdownReasonCache, persisted };
+}
+
+/**
+ * Exact string/BigInt parser & canonicalizer for BEP-20 USDT withdraw reward amounts
+ * (ZERO floating-point rounding drift). Accepts inputs like `"1"`, `"1.5"`, `"$2.25"`, `"0.125 USDT"`.
+ */
+export function parseAndFormatWithdrawAmountUsdt(
+  rawAmount: string,
+): { ok: true; amount: string; amountWei: bigint } | { ok: false; error: string } {
+  const cleaned = rawAmount
+    .trim()
+    .replace(/^\$\s*/, '')
+    .replace(/\s*usdt$/i, '')
+    .trim();
+
+  if (!/^\d+(?:\.\d{1,6})?$/.test(cleaned)) {
+    return {
+      ok: false,
+      error: 'Invalid USDT amount format. Enter a positive decimal up to 6 decimals (e.g. 1, 1.5, 2.25, 0.05).',
+    };
   }
+
+  const [rawInt, rawFrac = ''] = cleaned.split('.');
+  const cleanInt = rawInt.replace(/^0+(?=\d)/, '') || '0';
+  const trimmedFrac = rawFrac.replace(/0+$/, '');
+  const paddedFrac = trimmedFrac.length >= 2 ? trimmedFrac : trimmedFrac.padEnd(2, '0');
+  const formatted = `${cleanInt}.${paddedFrac}`;
+
+  let amountWei: bigint;
+  try {
+    amountWei = ethers.parseUnits(formatted, 18);
+  } catch {
+    return { ok: false, error: 'Could not parse USDT amount cleanly.' };
+  }
+
+  const maxWei = ethers.parseUnits('10000', 18);
+  if (amountWei <= 0n || amountWei > maxWei) {
+    return { ok: false, error: 'Amount must be greater than 0 and at most 10,000 USDT.' };
+  }
+
+  return { ok: true, amount: formatted, amountWei };
+}
+
+/**
+ * Validates and persists the admin-configured BEP-20 USDT reward amount per completed claim
+ * with exact BigInt / string decimal precision (no IEEE-754 rounding bugs).
+ */
+export async function setWithdrawAmountUsdt(
+  rawAmount: string,
+): Promise<{ ok: true; amount: string; persisted: boolean } | { ok: false; error: string }> {
+  const parsed = parseAndFormatWithdrawAmountUsdt(rawAmount);
+  if (!parsed.ok) return parsed;
+
+  withdrawAmountUsdtCache = parsed.amount;
+  const persisted = await upsertBotSetting('withdraw_amount_usdt', parsed.amount);
+  logger.info(
+    { withdrawAmountUsdt: parsed.amount, amountWei: parsed.amountWei.toString(), persisted },
+    'Updated withdraw_amount_usdt',
+  );
+  return { ok: true, amount: parsed.amount, persisted };
+}
+
+/** Persists the connected Admin Agent Wallet address & connectivity state. */
+export async function setAdminWalletConfig(
+  address: string | null,
+  connected: boolean,
+): Promise<{ address: string | null; connected: boolean; persisted: boolean }> {
+  adminWalletAddressCache = address ? address.trim() : null;
+  adminWalletConnectedCache = Boolean(connected && adminWalletAddressCache);
+  const [p1, p2] = await Promise.all([
+    upsertBotSetting('admin_wallet_address', adminWalletAddressCache ?? ''),
+    upsertBotSetting('admin_wallet_connected', adminWalletConnectedCache ? 'true' : 'false'),
+  ]);
+  return {
+    address: adminWalletAddressCache,
+    connected: adminWalletConnectedCache,
+    persisted: p1 && p2,
+  };
 }
 
 pool.on('error', (err) => {
@@ -151,6 +299,30 @@ export async function initDb(): Promise<void> {
     await client.query(`ALTER TABLE executions ADD COLUMN IF NOT EXISTS claim_attempts INT`);
     await client.query(`ALTER TABLE executions ADD COLUMN IF NOT EXISTS payout_wallet_address TEXT`);
     await client.query(`ALTER TABLE executions ADD COLUMN IF NOT EXISTS payout_mode TEXT`);
+    await client.query(`ALTER TABLE executions ADD COLUMN IF NOT EXISTS claim_payout_status TEXT`);
+    await client.query(`ALTER TABLE executions ADD COLUMN IF NOT EXISTS claim_payout_amount_usdt NUMERIC`);
+    await client.query(`ALTER TABLE executions ADD COLUMN IF NOT EXISTS claim_payout_tx_hash TEXT`);
+
+    // Anti-abuse Reward Claims ledger & strict 1-time-per-Agent-ID/Wallet payout lock
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS reward_claims (
+        id                    BIGSERIAL   PRIMARY KEY,
+        execution_id          BIGINT      REFERENCES executions (id) ON DELETE SET NULL,
+        telegram_user_id      BIGINT      NOT NULL,
+        agent_id_name         TEXT        NOT NULL,
+        agent_wallet_address  TEXT        NOT NULL,
+        payout_wallet_address TEXT        NOT NULL,
+        payout_mode           TEXT        NOT NULL,
+        amount_usdt           NUMERIC     NOT NULL,
+        status                TEXT        NOT NULL,
+        referral_verified     BOOLEAN     NOT NULL DEFAULT FALSE,
+        payout_tx_hash        TEXT,
+        failure_reason        TEXT,
+        created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+        paid_at               TIMESTAMPTZ
+      );
+    `);
 
     // Durable retry queue for guaranteed admin completion & payout notifications
     await client.query(`
@@ -196,15 +368,51 @@ export async function initDb(): Promise<void> {
     await client.query(`CREATE INDEX IF NOT EXISTS idx_admin_notif_pending ON admin_notifications (status, next_retry_at) WHERE status = 'PENDING'`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_admin_notif_exec    ON admin_notifications (execution_id) WHERE execution_id IS NOT NULL`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_admin_notif_user    ON admin_notifications (telegram_user_id, created_at DESC)`);
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_reward_claims_agent_id
+      ON reward_claims (LOWER(agent_id_name))
+      WHERE status IN ('PROCESSING', 'PAID', 'MANUAL_REVIEW')
+    `);
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_reward_claims_agent_wallet
+      ON reward_claims (LOWER(agent_wallet_address))
+      WHERE status IN ('PROCESSING', 'PAID', 'MANUAL_REVIEW')
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_reward_claims_user   ON reward_claims (telegram_user_id, created_at DESC)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_reward_claims_payout ON reward_claims (LOWER(payout_wallet_address))`);
 
-    // Load persisted bot_paused state so admin stop/start survives restarts
-    const pauseRes = await client.query<{ value: string }>(
-      `SELECT value FROM bot_settings WHERE key = 'bot_paused' LIMIT 1`,
+    // Load persisted runtime settings so stop/emergency-shutdown/withdraw-amount/admin-wallet survive restarts
+    const settingsRes = await client.query<{ key: string; value: string }>(
+      `SELECT key, value FROM bot_settings
+       WHERE key IN (
+         'bot_paused', 'maintenance_mode', 'maintenance_reason',
+         'withdraw_amount_usdt', 'admin_wallet_address', 'admin_wallet_connected'
+       )`,
     );
-    botPausedCache = pauseRes.rows[0]?.value === 'true';
+    const settingsMap = new Map(settingsRes.rows.map((r) => [r.key, r.value]));
+    botPausedCache = settingsMap.get('bot_paused') === 'true';
+    emergencyShutdownCache = settingsMap.get('maintenance_mode') === 'true';
+    emergencyShutdownReasonCache = settingsMap.get('maintenance_reason') || null;
+    const savedWithdraw = settingsMap.get('withdraw_amount_usdt');
+    if (savedWithdraw) {
+      const parsed = parseAndFormatWithdrawAmountUsdt(savedWithdraw);
+      if (parsed.ok) withdrawAmountUsdtCache = parsed.amount;
+    }
+    adminWalletAddressCache = settingsMap.get('admin_wallet_address') || null;
+    adminWalletConnectedCache =
+      settingsMap.get('admin_wallet_connected') === 'true' && Boolean(adminWalletAddressCache);
 
     dbReady = true;
-    logger.info({ botPaused: botPausedCache }, 'Database schema ready');
+    logger.info(
+      {
+        botPaused: botPausedCache,
+        emergencyShutdown: emergencyShutdownCache,
+        withdrawAmountUsdt: withdrawAmountUsdtCache,
+        adminWalletConnected: adminWalletConnectedCache,
+        adminWalletAddress: adminWalletAddressCache,
+      },
+      'Database schema ready',
+    );
   } catch (err) {
     dbReady = false;
     throw err;
@@ -397,6 +605,9 @@ export interface DbExecution {
   claim_attempts?: number | null;
   payout_wallet_address?: string | null;
   payout_mode?: PayoutMode | string | null;
+  claim_payout_status?: string | null;
+  claim_payout_amount_usdt?: string | null;
+  claim_payout_tx_hash?: string | null;
   tx_hashes: Record<string, string> | null;
   summary: string | null;
   created_at: Date;
@@ -993,23 +1204,36 @@ export async function getUserExecutions(
 }
 
 /**
- * Recovers a pending payout prompt across bot restarts: if a user is in
- * `current_step = 'awaiting_payout_wallet'` and has a COMPLETED execution with
- * `payout_wallet_address IS NULL`, returns that execution plus the user's current
- * `completed_count` so pasted BEP-20 addresses or Skip clicks still finalize cleanly.
+ * Recovers a pending payout wallet OR pending "Claim Your Reward" state across bot restarts:
+ *   - `current_step = 'awaiting_payout_wallet'` → returns COMPLETED execution with `payout_wallet_address IS NULL`
+ *   - `current_step = 'awaiting_claim'` → returns COMPLETED execution with `payout_wallet_address IS NOT NULL`
+ *     and `claim_payout_status` not yet `PAID` / `MANUAL_REVIEW`.
  */
 export async function getPendingPayoutExecution(
   userId: number,
-): Promise<{ execution: DbExecution; completedCount: number } | null> {
+): Promise<{
+  step: 'awaiting_payout_wallet' | 'awaiting_claim';
+  execution: DbExecution;
+  completedCount: number;
+} | null> {
   try {
-    const { rows } = await pool.query<DbExecution & { user_completed_count: number }>(
-      `SELECT e.*, u.completed_count AS user_completed_count
+    const { rows } = await pool.query<
+      DbExecution & { user_completed_count: number; user_step: string }
+    >(
+      `SELECT e.*, u.completed_count AS user_completed_count, u.current_step AS user_step
        FROM users u
        INNER JOIN executions e ON e.telegram_user_id = u.telegram_user_id
        WHERE u.telegram_user_id = $1
-         AND u.current_step = 'awaiting_payout_wallet'
+         AND u.current_step IN ('awaiting_payout_wallet', 'awaiting_claim')
          AND e.status = 'COMPLETED'
-         AND e.payout_wallet_address IS NULL
+         AND (
+           (u.current_step = 'awaiting_payout_wallet' AND e.payout_wallet_address IS NULL)
+           OR (
+             u.current_step = 'awaiting_claim'
+             AND e.payout_wallet_address IS NOT NULL
+             AND COALESCE(e.claim_payout_status, '') NOT IN ('PAID', 'MANUAL_REVIEW')
+           )
+         )
        ORDER BY e.created_at DESC, e.id DESC
        LIMIT 1`,
       [userId],
@@ -1017,13 +1241,247 @@ export async function getPendingPayoutExecution(
     dbReady = true;
     const row = rows[0];
     if (!row) return null;
+    const step = row.user_step === 'awaiting_claim' ? 'awaiting_claim' : 'awaiting_payout_wallet';
     return {
+      step,
       execution: row,
       completedCount: Math.max(1, Number(row.user_completed_count ?? 1)),
     };
   } catch (err) {
     logger.warn({ err: (err as Error)?.message, userId }, 'getPendingPayoutExecution: DB read failed');
     return null;
+  }
+}
+
+// ─── Anti-Abuse Reward Claim Lock & Ledger ───────────────────────────────────
+// Strictly forbids claiming/paying more than once for the SAME Agent ID or SAME Agent Wallet
+// while allowing one user / one BEP-20 payout wallet to claim across unlimited distinct Agent IDs.
+
+export type RewardClaimStatus = 'PROCESSING' | 'PAID' | 'MANUAL_REVIEW' | 'FAILED_SYSTEM';
+
+const lockedClaimAgentIdsMem     = new Set<string>();
+const lockedClaimAgentWalletsMem = new Set<string>();
+
+function normalizeClaimKey(v?: string | null): string | null {
+  const s = v?.trim().toLowerCase();
+  return s && s.length > 0 ? s : null;
+}
+
+export async function hasClaimedRewardForAgent(opts: {
+  agentIdName?: string | null;
+  agentWalletAddress?: string | null;
+}): Promise<{ claimed: boolean; status?: string; matchedBy?: 'agent_id' | 'agent_wallet' }> {
+  const agent  = normalizeClaimKey(opts.agentIdName);
+  const wallet = normalizeClaimKey(opts.agentWalletAddress);
+  if (!agent && !wallet) return { claimed: false };
+
+  if (agent && lockedClaimAgentIdsMem.has(agent)) {
+    return { claimed: true, matchedBy: 'agent_id' };
+  }
+  if (wallet && lockedClaimAgentWalletsMem.has(wallet)) {
+    return { claimed: true, matchedBy: 'agent_wallet' };
+  }
+
+  try {
+    const { rows } = await pool.query<{
+      status: string;
+      matched_agent: boolean;
+      matched_wallet: boolean;
+    }>(
+      `SELECT status,
+              ($1::text IS NOT NULL AND LOWER(agent_id_name) = $1) AS matched_agent,
+              ($2::text IS NOT NULL AND LOWER(agent_wallet_address) = $2) AS matched_wallet
+       FROM reward_claims
+       WHERE status IN ('PROCESSING', 'PAID', 'MANUAL_REVIEW')
+         AND (
+           ($1::text IS NOT NULL AND LOWER(agent_id_name) = $1)
+           OR ($2::text IS NOT NULL AND LOWER(agent_wallet_address) = $2)
+         )
+       LIMIT 1`,
+      [agent, wallet],
+    );
+    dbReady = true;
+    const r = rows[0];
+    if (r) {
+      if (agent) lockedClaimAgentIdsMem.add(agent);
+      if (wallet) lockedClaimAgentWalletsMem.add(wallet);
+      return {
+        claimed: true,
+        status: r.status,
+        matchedBy: r.matched_agent ? 'agent_id' : 'agent_wallet',
+      };
+    }
+    return { claimed: false };
+  } catch (err) {
+    logger.warn({ err: (err as Error)?.message, agent, wallet }, 'hasClaimedRewardForAgent: DB check failed (using memory lock)');
+    return { claimed: false };
+  }
+}
+
+/**
+ * Atomically reserves a reward claim slot for `(agentIdName, agentWalletAddress)`.
+ * Backed by BOTH in-memory mutex sets AND PostgreSQL partial unique indexes
+ * (`uq_reward_claims_agent_id`, `uq_reward_claims_agent_wallet`) so concurrent
+ * double-clicks or repeat claims on the same Agent ID / Agent Wallet are impossible.
+ */
+export async function reserveRewardClaim(opts: {
+  executionId: number | null;
+  telegramUserId: number;
+  agentIdName: string;
+  agentWalletAddress: string;
+  payoutWalletAddress: string;
+  payoutMode: PayoutMode;
+  amountUsdt: string;
+}): Promise<{ reserved: true; claimId: number | null } | { reserved: false; duplicate: boolean; reason: string }> {
+  const agentKey  = normalizeClaimKey(opts.agentIdName);
+  const walletKey = normalizeClaimKey(opts.agentWalletAddress);
+  if (!agentKey || !walletKey) {
+    return { reserved: false, duplicate: false, reason: 'Missing Agent ID or Agent Wallet for claim lock.' };
+  }
+
+  if (lockedClaimAgentIdsMem.has(agentKey) || lockedClaimAgentWalletsMem.has(walletKey)) {
+    return { reserved: false, duplicate: true, reason: 'Agent ID or Agent Wallet already claimed/locked.' };
+  }
+
+  // Acquire synchronous in-memory lock immediately before awaiting DB
+  lockedClaimAgentIdsMem.add(agentKey);
+  lockedClaimAgentWalletsMem.add(walletKey);
+
+  try {
+    const { rows } = await pool.query<{ id: number }>(
+      `INSERT INTO reward_claims
+         (execution_id, telegram_user_id, agent_id_name, agent_wallet_address,
+          payout_wallet_address, payout_mode, amount_usdt, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'PROCESSING')
+       RETURNING id`,
+      [
+        opts.executionId,
+        opts.telegramUserId,
+        opts.agentIdName.trim(),
+        opts.agentWalletAddress.trim(),
+        opts.payoutWalletAddress.trim(),
+        opts.payoutMode,
+        opts.amountUsdt,
+      ],
+    );
+    dbReady = true;
+    return { reserved: true, claimId: rows[0]?.id ?? null };
+  } catch (err) {
+    const pgCode = (err as { code?: string })?.code;
+    if (pgCode === '23505') {
+      // Unique constraint hit — keep in-memory lock set because this Agent ID/Wallet is permanently claimed
+      return { reserved: false, duplicate: true, reason: 'Duplicate claim blocked by database uniqueness lock.' };
+    }
+    logger.warn(
+      { err: (err as Error)?.message, agentIdName: opts.agentIdName, agentWalletAddress: opts.agentWalletAddress },
+      'reserveRewardClaim: DB insert failed — continuing with in-memory lock active',
+    );
+    return { reserved: true, claimId: null };
+  }
+}
+
+export async function finalizeRewardClaim(opts: {
+  claimId: number | null;
+  executionId: number | null;
+  status: 'PAID' | 'MANUAL_REVIEW';
+  referralVerified: boolean;
+  amountUsdt: string;
+  payoutTxHash?: string | null;
+  failureReason?: string | null;
+  agentIdName: string;
+  agentWalletAddress: string;
+}): Promise<void> {
+  const agentKey  = normalizeClaimKey(opts.agentIdName);
+  const walletKey = normalizeClaimKey(opts.agentWalletAddress);
+  if (agentKey) lockedClaimAgentIdsMem.add(agentKey);
+  if (walletKey) lockedClaimAgentWalletsMem.add(walletKey);
+
+  try {
+    if (opts.claimId != null) {
+      await withDbRetry('finalizeRewardClaim', () =>
+        pool.query(
+          `UPDATE reward_claims
+           SET status            = $2,
+               referral_verified = $3,
+               payout_tx_hash    = $4,
+               failure_reason    = $5,
+               updated_at        = now(),
+               paid_at           = CASE WHEN $2 = 'PAID' THEN now() ELSE paid_at END
+           WHERE id = $1`,
+          [opts.claimId, opts.status, opts.referralVerified, opts.payoutTxHash ?? null, opts.failureReason ?? null],
+        ),
+      );
+    }
+  } catch (err) {
+    logger.warn({ err: (err as Error)?.message, claimId: opts.claimId }, 'finalizeRewardClaim: DB update failed');
+  }
+
+  await updateExecutionClaimPayout(opts.executionId, {
+    status: opts.status,
+    amountUsdt: opts.amountUsdt,
+    txHash: opts.payoutTxHash ?? null,
+  });
+}
+
+/**
+ * Releases the anti-abuse lock ONLY when an Admin Agent Wallet / system failure occurs
+ * BEFORE a payout succeeds (e.g. admin wallet disconnected or out of USDT/BNB triggering
+ * Emergency Auto-Shutdown), so the legitimate user is not permanently locked out once fixed.
+ */
+export async function releaseRewardClaimOnSystemFailure(opts: {
+  claimId: number | null;
+  executionId: number | null;
+  amountUsdt: string;
+  failureReason: string;
+  agentIdName: string;
+  agentWalletAddress: string;
+}): Promise<void> {
+  const agentKey  = normalizeClaimKey(opts.agentIdName);
+  const walletKey = normalizeClaimKey(opts.agentWalletAddress);
+  if (agentKey) lockedClaimAgentIdsMem.delete(agentKey);
+  if (walletKey) lockedClaimAgentWalletsMem.delete(walletKey);
+
+  try {
+    if (opts.claimId != null) {
+      await pool.query(
+        `UPDATE reward_claims
+         SET status         = 'FAILED_SYSTEM',
+             failure_reason = $2,
+             updated_at     = now()
+         WHERE id = $1`,
+        [opts.claimId, opts.failureReason.slice(0, 400)],
+      );
+      dbReady = true;
+    }
+  } catch (err) {
+    logger.warn({ err: (err as Error)?.message, claimId: opts.claimId }, 'releaseRewardClaimOnSystemFailure: DB update failed');
+  }
+
+  await updateExecutionClaimPayout(opts.executionId, {
+    status: 'FAILED_SYSTEM',
+    amountUsdt: opts.amountUsdt,
+    txHash: null,
+  });
+}
+
+export async function updateExecutionClaimPayout(
+  executionId: number | null,
+  opts: { status: RewardClaimStatus; amountUsdt: string; txHash?: string | null },
+): Promise<void> {
+  if (executionId == null) return;
+  try {
+    await withDbRetry('updateExecutionClaimPayout', () =>
+      pool.query(
+        `UPDATE executions
+         SET claim_payout_status      = $2,
+             claim_payout_amount_usdt = $3,
+             claim_payout_tx_hash     = COALESCE($4, claim_payout_tx_hash)
+         WHERE id = $1`,
+        [executionId, opts.status, opts.amountUsdt, opts.txHash ?? null],
+      ),
+    );
+  } catch (err) {
+    logger.warn({ err: (err as Error)?.message, executionId }, 'updateExecutionClaimPayout failed');
   }
 }
 
@@ -1083,6 +1541,9 @@ export interface AdminCompletedExecution {
   claim_attempts: number | null;
   payout_wallet_address: string | null;
   payout_mode: string | null;
+  claim_payout_status: string | null;
+  claim_payout_amount_usdt: string | null;
+  claim_payout_tx_hash: string | null;
   pending_admin_alerts: number;
   created_at: Date;
 }
@@ -1112,6 +1573,9 @@ export async function getAllCompletedExecutions(): Promise<AdminCompletedExecuti
        e.claim_attempts,
        e.payout_wallet_address,
        e.payout_mode,
+       e.claim_payout_status,
+       e.claim_payout_amount_usdt,
+       e.claim_payout_tx_hash,
        COALESCE(pn.pending_cnt, 0)::int AS pending_admin_alerts,
        e.created_at
      FROM executions e

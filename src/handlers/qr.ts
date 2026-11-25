@@ -3,6 +3,7 @@ import { Context } from 'telegraf';
 import { getSession, getSessionLinkFromDb } from '../wallet.js';
 import { safeUpdateUser } from '../db.js';
 import { generateQrBuffer } from '../qr.js';
+import { isAdminId } from '../config.js';
 import { KB } from '../keyboards.js';
 import { logger } from '../logger.js';
 
@@ -13,6 +14,16 @@ async function safeAnswerCb(ctx: Context, text?: string): Promise<void> {
 export async function handleGenerateQr(ctx: Context): Promise<void> {
   const userId = ctx.from?.id;
   if (!userId) return;
+
+  if (isAdminId(userId)) {
+    await safeAnswerCb(ctx, 'Admin accounts use Admin Dashboard');
+    await ctx.reply(
+      '🛡️ Admin Role Isolation: Use /admin → "💼 Connect Admin Wallet" (/admin_wallet) to pair the Admin Treasury Wallet.',
+      KB.adminMenu,
+    );
+    return;
+  }
+
   await safeAnswerCb(ctx, 'Generating QR code…');
 
   try {

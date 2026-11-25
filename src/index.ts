@@ -6,6 +6,8 @@ import {
   initDb,
   isDbAvailable,
   isBotPaused,
+  isEmergencyShutdown,
+  getEmergencyShutdownReason,
   getInMemoryPendingAdminNotificationCount,
   pool,
 } from './db.js';
@@ -25,6 +27,7 @@ import {
   handleConfirmExecuteCycle,
   handleCancelPreview,
   handleSkipPayoutWallet,
+  handleClaimReward,
 } from './handlers/execute.js';
 import { handleMyJobs }        from './handlers/jobs.js';
 import { handleCancel }        from './handlers/cancel.js';
@@ -35,26 +38,43 @@ import {
   handleAdminIncomplete,
   handleAdminBotStop,
   handleAdminBotStart,
+  handleAdminResume,
+  handleAdminConnectWallet,
+  handleAdminDisconnectWallet,
+  handleAdminAdjustWithdraw,
 } from './handlers/admin.js';
 import { handleMessage }       from './handlers/message.js';
 
 const bot = new Telegraf(config.TELEGRAM_BOT_TOKEN);
 
-// ── Global Admin Stop/Start Gate (MUST run before every command, action, and text handler) ──
-// When paused by an admin, nothing works for normal users while configured ADMIN_ID(s)
-// retain full access to every command, button, and process.
+// ── Global Emergency Auto-Shutdown & Admin Stop Gate (MUST run before every command, action, and text handler) ──
+// When Emergency Auto-Shutdown is active, all non-admin users immediately see the Bangla maintenance notice.
+// When paused by an admin, normal users are blocked while configured ADMIN_ID(s) retain full admin panel access.
 bot.use(async (ctx, next) => {
   const userId = ctx.from?.id;
-  if (isBotPaused() && !isAdminId(userId)) {
-    try {
-      if (ctx.callbackQuery) {
-        await ctx.answerCbQuery('Bot is currently stopped by admin.');
-      }
-    } catch { /* ignore */ }
-    try {
-      await ctx.reply('⛔ The bot is currently stopped by the administrator. Please try again later.');
-    } catch { /* ignore */ }
-    return;
+  if (!isAdminId(userId)) {
+    if (isEmergencyShutdown()) {
+      try {
+        if (ctx.callbackQuery) {
+          await ctx.answerCbQuery('বট আপডেট হচ্ছে।');
+        }
+      } catch { /* ignore */ }
+      try {
+        await ctx.reply('⚠️ কিছু যান্ত্রিক ত্রুটির কারণে সমস্যা হচ্ছে, বটটা আপডেট হচ্ছে।');
+      } catch { /* ignore */ }
+      return;
+    }
+    if (isBotPaused()) {
+      try {
+        if (ctx.callbackQuery) {
+          await ctx.answerCbQuery('Bot is currently stopped by admin.');
+        }
+      } catch { /* ignore */ }
+      try {
+        await ctx.reply('⛔ The bot is currently stopped by the administrator. Please try again later.');
+      } catch { /* ignore */ }
+      return;
+    }
   }
   return next();
 });
@@ -68,14 +88,18 @@ bot.command('status',           handleMyJobs);          // Personal status & inc
 bot.command('my_jobs',          handleMyJobs);          // Personal status alias
 
 // Admin-only commands (strictly gated by config.ADMIN_IDS inside handlers)
-bot.command('admin',            handleAdminOverview);
-bot.command('admin_users',      handleAdminUsers);
-bot.command('admin_completed',  handleAdminCompleted);
-bot.command('admin_incomplete', handleAdminIncomplete);
-bot.command('admin_stop',       handleAdminBotStop);
-bot.command('stop_bot',         handleAdminBotStop);
-bot.command('admin_start',      handleAdminBotStart);
-bot.command('start_bot',        handleAdminBotStart);
+bot.command('admin',                   handleAdminOverview);
+bot.command('admin_users',             handleAdminUsers);
+bot.command('admin_completed',         handleAdminCompleted);
+bot.command('admin_incomplete',        handleAdminIncomplete);
+bot.command('admin_wallet',            handleAdminConnectWallet);
+bot.command('admin_wallet_disconnect', handleAdminDisconnectWallet);
+bot.command('admin_withdraw',          handleAdminAdjustWithdraw);
+bot.command('admin_resume',            handleAdminResume);
+bot.command('admin_stop',              handleAdminBotStop);
+bot.command('stop_bot',                handleAdminBotStop);
+bot.command('admin_start',             handleAdminBotStart);
+bot.command('start_bot',               handleAdminBotStart);
 
 // ── Inline button handlers ───────────────────────────────────────────────────
 bot.action('connect_wallet',        handleConnectWallet);
@@ -85,16 +109,20 @@ bot.action('complete_process',      handleCompleteProcess);
 bot.action('confirm_execute_cycle', handleConfirmExecuteCycle);
 bot.action('cancel_preview',        handleCancelPreview);
 bot.action('skip_payout_wallet',    handleSkipPayoutWallet);
+bot.action('claim_reward',          handleClaimReward);
 bot.action('my_jobs',               handleMyJobs);
 bot.action('cancel',                handleCancel);
 
 // Admin-only inline button callbacks (strictly gated inside handlers)
-bot.action('admin_overview',   handleAdminOverview);
-bot.action('admin_users',      handleAdminUsers);
-bot.action('admin_completed',  handleAdminCompleted);
-bot.action('admin_incomplete', handleAdminIncomplete);
-bot.action('admin_bot_stop',   handleAdminBotStop);
-bot.action('admin_bot_start',  handleAdminBotStart);
+bot.action('admin_overview',        handleAdminOverview);
+bot.action('admin_users',           handleAdminUsers);
+bot.action('admin_completed',       handleAdminCompleted);
+bot.action('admin_incomplete',      handleAdminIncomplete);
+bot.action('admin_connect_wallet',  handleAdminConnectWallet);
+bot.action('admin_adjust_withdraw', handleAdminAdjustWithdraw);
+bot.action('admin_resume',          handleAdminResume);
+bot.action('admin_bot_stop',        handleAdminBotStop);
+bot.action('admin_bot_start',       handleAdminBotStart);
 
 // ── Free-text NL routing (Gemini intent, free-tier-safe) ─────────────────────
 bot.on('text', handleMessage);
@@ -110,7 +138,13 @@ const healthServer = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status: 'ok',
-      botMode: isBotPaused() ? 'stopped_admin_only' : 'running',
+      botMode: isEmergencyShutdown()
+        ? 'emergency_auto_shutdown'
+        : isBotPaused()
+          ? 'stopped_admin_only'
+          : 'running',
+      emergencyShutdown: isEmergencyShutdown(),
+      emergencyReason: getEmergencyShutdownReason(),
       db: isDbAvailable() ? 'connected' : 'degraded',
       baw: bawAvailable() ? 'ready' : 'missing',
       pendingAdminAlertsMem: getInMemoryPendingAdminNotificationCount(),

@@ -8,6 +8,7 @@ import { handleGenerateQr } from './qr.js';
 import { handleCompleteProcess, handlePayoutWalletInput } from './execute.js';
 import { handleMyJobs } from './jobs.js';
 import { handleCancel } from './cancel.js';
+import { handleAdminWithdrawAmountInput } from './admin.js';
 import { KB } from '../keyboards.js';
 import { isAdminId } from '../config.js';
 
@@ -17,6 +18,18 @@ export async function handleMessage(ctx: Context): Promise<void> {
 
   // Skip commands — they have dedicated handlers
   if (text.startsWith('/')) return;
+
+  // Admin interactive Adjust Withdraw Amount input
+  if (await handleAdminWithdrawAmountInput(ctx, text)) return;
+
+  // Strict Admin Role Isolation: never route admin free-text into user execution/wallet intents
+  if (isAdminId(ctx.from?.id)) {
+    await ctx.reply(
+      '🛡️ Admin accounts are isolated to Admin Dashboard controls. Use the buttons below or /admin.',
+      KB.adminMenu,
+    );
+    return;
+  }
 
   // Capture pasted BEP-20 payment wallet address (or typed Skip) before Gemini routing
   if (await handlePayoutWalletInput(ctx, text)) return;

@@ -160,6 +160,9 @@ export interface ExecutionSummaryInput {
   payoutWalletAddress?: string;
   payoutMode?: 'CUSTOM_BEP20' | 'AGENT_WALLET_SKIPPED';
   skippedToAgentWallet?: boolean;
+  rewardClaimAmountUsdt?: string;
+  rewardClaimStatus?: 'PAID' | 'MANUAL_REVIEW' | 'FAILED_SYSTEM' | 'PENDING';
+  rewardClaimTxHash?: string;
   status: 'COMPLETED' | 'STOPPED' | 'FAILED';
   stopReason?: string;
 }
@@ -217,10 +220,23 @@ export function formatFastExecutionSummary(data: ExecutionSummaryInput): string 
       : 'Custom BEP-20 Wallet (সাবমিট করা BEP-20 ওয়ালেট)';
     lines.push(
       ``,
-      `💸 পেমেন্ট ওয়ালেট (Payment Wallet):`,
+      `💸 পেমেন্ট ওয়ালেট ও রিওয়ার্ড (Payment & Reward):`,
       `• Address (BEP-20): ${data.payoutWalletAddress}`,
       `• Mode: ${modeLabel}`,
     );
+    if (data.rewardClaimAmountUsdt) {
+      lines.push(`• Reward Amount: ${data.rewardClaimAmountUsdt} USDT (BEP-20)`);
+    }
+    if (data.rewardClaimStatus === 'PAID') {
+      lines.push(`• Payment Status: ✅ অটো পেমেন্ট সম্পন্ন (Auto-Paid Successfully)`);
+      if (data.rewardClaimTxHash) {
+        lines.push(`• Payout TX Hash: ${data.rewardClaimTxHash}`);
+      }
+    } else if (data.rewardClaimStatus === 'MANUAL_REVIEW') {
+      lines.push(`• Payment Status: ⚠️ ম্যানুয়াল পেমেন্ট রিভিউতে পাঠানো হয়েছে (Sent for Manual Payment Review)`);
+    } else if (data.rewardClaimStatus === 'FAILED_SYSTEM') {
+      lines.push(`• Payment Status: ⏳ অটো পেমেন্ট সাময়িকভাবে পেন্ডিং (Pending System Recovery)`);
+    }
   }
 
   lines.push(

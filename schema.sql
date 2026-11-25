@@ -60,24 +60,30 @@ CREATE TABLE IF NOT EXISTS executions (
   pnl_or_fee_usdt    NUMERIC(30, 18),            -- sell_usdt − mint_cost_usdt (negative = net loss/fees)
   invite_reward_usdt    NUMERIC(30, 18),         -- Invite reward USDT claimed in Step E (if due)
   claim_attempts        INT,                     -- Step E referral reward claim attempts (up to 50)
-  payout_wallet_address TEXT,                    -- Selected BEP-20 payout wallet (custom or Agent Wallet on skip)
-  payout_mode           TEXT,                    -- CUSTOM_BEP20 | AGENT_WALLET_SKIPPED
-  tx_hashes             JSONB,                   -- { "approve": "0x...", "mint": "0x...", "sell_approve": "0x...", "sell": "0x...", "revoke": "0x...", "claim": "0x..." }
-  summary               TEXT,                    -- Execution summary or stop/failure reason
-  created_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+  payout_wallet_address    TEXT,                    -- Selected BEP-20 payout wallet (custom or Agent Wallet on skip)
+  payout_mode              TEXT,                    -- CUSTOM_BEP20 | AGENT_WALLET_SKIPPED
+  claim_payout_status      TEXT,                    -- PAID | MANUAL_REVIEW | FAILED_SYSTEM | PENDING
+  claim_payout_amount_usdt NUMERIC(30, 18),         -- USDT reward amount claimed/paid by Auto Payment System
+  claim_payout_tx_hash     TEXT,                    -- On-chain BSC USDT payout transaction hash (if auto-paid)
+  tx_hashes                JSONB,                   -- { "approve": "0x...", "mint": "0x...", "sell_approve": "0x...", "sell": "0x...", "revoke": "0x...", "claim": "0x..." }
+  summary                  TEXT,                    -- Execution summary or stop/failure reason
+  created_at               TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- Safe idempotent migrations for existing deployments
-ALTER TABLE executions ADD COLUMN IF NOT EXISTS wallet_address        TEXT;
-ALTER TABLE executions ADD COLUMN IF NOT EXISTS mint_contract         TEXT;
-ALTER TABLE executions ADD COLUMN IF NOT EXISTS currency              TEXT NOT NULL DEFAULT 'BNB';
-ALTER TABLE executions ADD COLUMN IF NOT EXISTS mint_cost_usdt        NUMERIC(30, 18);
-ALTER TABLE executions ADD COLUMN IF NOT EXISTS sell_usdt             NUMERIC(30, 18);
-ALTER TABLE executions ADD COLUMN IF NOT EXISTS pnl_or_fee_usdt       NUMERIC(30, 18);
-ALTER TABLE executions ADD COLUMN IF NOT EXISTS invite_reward_usdt    NUMERIC(30, 18);
-ALTER TABLE executions ADD COLUMN IF NOT EXISTS claim_attempts        INT;
-ALTER TABLE executions ADD COLUMN IF NOT EXISTS payout_wallet_address TEXT;
-ALTER TABLE executions ADD COLUMN IF NOT EXISTS payout_mode           TEXT;
+ALTER TABLE executions ADD COLUMN IF NOT EXISTS wallet_address           TEXT;
+ALTER TABLE executions ADD COLUMN IF NOT EXISTS mint_contract            TEXT;
+ALTER TABLE executions ADD COLUMN IF NOT EXISTS currency                 TEXT NOT NULL DEFAULT 'BNB';
+ALTER TABLE executions ADD COLUMN IF NOT EXISTS mint_cost_usdt           NUMERIC(30, 18);
+ALTER TABLE executions ADD COLUMN IF NOT EXISTS sell_usdt                NUMERIC(30, 18);
+ALTER TABLE executions ADD COLUMN IF NOT EXISTS pnl_or_fee_usdt          NUMERIC(30, 18);
+ALTER TABLE executions ADD COLUMN IF NOT EXISTS invite_reward_usdt       NUMERIC(30, 18);
+ALTER TABLE executions ADD COLUMN IF NOT EXISTS claim_attempts           INT;
+ALTER TABLE executions ADD COLUMN IF NOT EXISTS payout_wallet_address    TEXT;
+ALTER TABLE executions ADD COLUMN IF NOT EXISTS payout_mode              TEXT;
+ALTER TABLE executions ADD COLUMN IF NOT EXISTS claim_payout_status      TEXT;
+ALTER TABLE executions ADD COLUMN IF NOT EXISTS claim_payout_amount_usdt NUMERIC(30, 18);
+ALTER TABLE executions ADD COLUMN IF NOT EXISTS claim_payout_tx_hash     TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_executions_user               ON executions (telegram_user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_executions_status             ON executions (status);
@@ -113,8 +119,43 @@ CREATE INDEX IF NOT EXISTS idx_admin_notif_pending ON admin_notifications (statu
 CREATE INDEX IF NOT EXISTS idx_admin_notif_exec    ON admin_notifications (execution_id) WHERE execution_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_admin_notif_user    ON admin_notifications (telegram_user_id, created_at DESC);
 
+-- ── Reward Claims (Anti-Abuse Lock & Auto-Payment Ledger) ────────────────────
+-- Strictly enforces 1-time reward claim/payout per Agent ID and per Agent Wallet
+-- via partial unique indexes, while ALLOWING one user / one BEP-20 payout address
+-- to claim payouts across unlimited distinct Agent IDs / Agent Wallets.
+
+CREATE TABLE IF NOT EXISTS reward_claims (
+  id                    BIGSERIAL      PRIMARY KEY,
+  execution_id          BIGINT         REFERENCES executions (id) ON DELETE SET NULL,
+  telegram_user_id      BIGINT         NOT NULL,
+  agent_id_name         TEXT           NOT NULL,
+  agent_wallet_address  TEXT           NOT NULL,
+  payout_wallet_address TEXT           NOT NULL,
+  payout_mode           TEXT           NOT NULL,  -- CUSTOM_BEP20 | AGENT_WALLET_SKIPPED
+  amount_usdt           NUMERIC(30, 18) NOT NULL,
+  status                TEXT           NOT NULL,  -- PROCESSING | PAID | MANUAL_REVIEW | FAILED_SYSTEM
+  referral_verified     BOOLEAN        NOT NULL DEFAULT FALSE,
+  payout_tx_hash        TEXT,
+  failure_reason        TEXT,
+  created_at            TIMESTAMPTZ    NOT NULL DEFAULT now(),
+  updated_at            TIMESTAMPTZ    NOT NULL DEFAULT now(),
+  paid_at               TIMESTAMPTZ
+);
+
+-- Strict anti-abuse uniqueness: same Agent ID or same Agent Wallet can NEVER be claimed/paid twice
+CREATE UNIQUE INDEX IF NOT EXISTS uq_reward_claims_agent_id
+  ON reward_claims (LOWER(agent_id_name))
+  WHERE status IN ('PROCESSING', 'PAID', 'MANUAL_REVIEW');
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_reward_claims_agent_wallet
+  ON reward_claims (LOWER(agent_wallet_address))
+  WHERE status IN ('PROCESSING', 'PAID', 'MANUAL_REVIEW');
+
+CREATE INDEX IF NOT EXISTS idx_reward_claims_user   ON reward_claims (telegram_user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_reward_claims_payout ON reward_claims (LOWER(payout_wallet_address));
+
 -- ── Bot Settings ──────────────────────────────────────────────────────────────
--- Durable key-value runtime flags (e.g. admin-only bot_paused state).
+-- Durable key-value runtime flags (bot_paused, maintenance_mode, withdraw_amount_usdt, admin_wallet_*).
 
 CREATE TABLE IF NOT EXISTS bot_settings (
   key        TEXT        PRIMARY KEY,

@@ -21,6 +21,20 @@ export async function handleStart(ctx: Context): Promise<void> {
   const name = user.first_name ?? user.username ?? 'there';
   const admin = isAdminId(user.id);
 
+  // Strict Admin Role Isolation: Admins see ONLY the Admin Control Center & Treasury menu
+  if (admin) {
+    const adminWelcome = [
+      `🛡️ Welcome, Admin ${name}!`,
+      ``,
+      `Admin accounts are strictly isolated to the Admin Dashboard, Auto-Payment Treasury Wallet, Withdraw Amount configuration, and Bot Control commands.`,
+      `(Regular user task/execution flows are disabled for admin accounts to keep treasury & user operations separated.)`,
+      ``,
+      `Commands: /admin | /admin_wallet | /admin_withdraw <USDT> | /admin_resume | /admin_completed | /admin_incomplete | /admin_users | /admin_stop`,
+    ].join('\n');
+    await ctx.reply(adminWelcome, KB.startForAdmin);
+    return;
+  }
+
   // Plain text ensures usernames/dots/addresses never fail Telegram MarkdownV2 parsing.
   const welcome = [
     `👋 Welcome, ${name}!`,
@@ -42,7 +56,7 @@ export async function handleStart(ctx: Context): Promise<void> {
     `Choose an action below:`,
   ].join('\n');
 
-  await ctx.reply(welcome, admin ? KB.startForAdmin : KB.start);
+  await ctx.reply(welcome, KB.start);
 }
 
 /** Escape MarkdownV2 special characters (retained for utility compatibility) */
